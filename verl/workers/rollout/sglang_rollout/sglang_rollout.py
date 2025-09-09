@@ -1304,7 +1304,7 @@ class SGLangRollout(BaseRollout):
             rollout_output_token_ids = pad_sequence_to_length(
                 rollout_output_token_ids, pad_token_id=self.pad_token_id, max_seq_len=response_ids.shape[-1]
             ).to(tgt_device)
-
+        # 将填充后的 prompt 和 response 的 IDs、attention masks 等在最后一个维度上进行拼接，形成完整的序列数据。
         input_ids = torch.cat((prompt_ids, response_ids), dim=-1)
         attention_mask = torch.cat((prompt_attention_mask, response_attention_mask), dim=-1)
         position_ids = torch.cat((prompt_position_ids, response_position_ids), dim=-1)

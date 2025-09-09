@@ -14,7 +14,7 @@
 
 import asyncio
 import importlib
-import logging
+import json, logging
 import os
 import sys
 import threading
@@ -23,6 +23,8 @@ from enum import Enum
 from omegaconf import OmegaConf
 
 from verl.tools.schemas import OpenAIFunctionToolSchema
+from verl.tools.utils.mcp_clients.AgentCPMMCPClientManager import MCPManager as RESTManager
+from verl.tools.rest_tool import RESTMCPTool
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -31,6 +33,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 class ToolType(Enum):
     NATIVE = "native"
     MCP = "mcp"
+    AgentCPMMCP = "agent-cpm-mcp"
 
 
 async def initialize_mcp_tool(tool_cls, tool_config) -> list:
@@ -64,6 +67,50 @@ async def initialize_mcp_tool(tool_cls, tool_config) -> list:
         tool_list.append(tool)
     return tool_list
 
+async def initialize_agentcpm_mcp_tool(tool_cls, tool_config) -> list:
+    """
+    - 从 mcp_servers_config_path 读取 base_url（键：mcpServers.http-agentmcp.url）
+    - 初始化 REST Manager：拉 /servers 与 /tools
+    - 用 REST 返回的 OpenAI function schema 批量实例化 tool_cls（建议传 RESTMCPTool）
+    """
+    tool_list = []
+
+    with open(tool_config.mcp.mcp_servers_config_path, "r") as f:
+        cfg = json.load(f)
+
+    assert "mcpServers" in cfg and isinstance(cfg["mcpServers"], dict), "缺少 mcpServers"
+    assert "http-agentmcp" in cfg["mcpServers"] and "url" in cfg["mcpServers"]["http-agentmcp"], \
+        "配置需包含 mcpServers.http-agentmcp.url 指向 /mcpapi 基地址"
+
+    base = cfg["mcpServers"]["http-agentmcp"]["url"]
+    timeout = tool_config.config.timeout
+
+    # 1) 初始化 REST Manager，并缓存到 RESTMCPTool 的类属性，供所有实例共享
+    rest_mgr = RESTManager(manager_url=base, timeout=timeout)
+    ok = await rest_mgr.initialize()
+    assert ok, "REST MCPManager 初始化失败"
+    RESTMCPTool._rest_manager = rest_mgr
+
+    # 2) 选择要加载的工具（可用 tool_selected_list 白名单）
+    selected = set(tool_config.mcp.tool_selected_list) if "tool_selected_list" in tool_config.mcp else None
+    schemas = await rest_mgr.fetch_tool_schemas(list(selected) if selected else None)
+    assert schemas, "mcp tool is empty (REST)"
+    assert issubclass(tool_cls, RESTMCPTool), "REST 接法 仅支持 RESTMCPTool 作为工具类"
+
+    # 3) 批量实例化工具（工具类建议用 RESTMCPTool；如果传入自定义子类也行）
+    for schema_dict in schemas:
+        try:
+            tool_schema = OpenAIFunctionToolSchema.model_validate(schema_dict)
+        except Exception as e:
+            logger.debug(f"schema_dict: {schema_dict} Exception: {e}")
+            continue
+        tool = tool_cls(
+            config=OmegaConf.to_container(tool_config.config, resolve=True),
+            tool_schema=tool_schema,
+        )
+        tool_list.append(tool)
+
+    return tool_list
 
 def get_tool_class(cls_name):
     module_name, class_name = cls_name.rsplit(".", 1)
@@ -119,6 +166,9 @@ def initialize_tools_from_config(tools_config_file):
                     tool_list.append(tool)
                 case ToolType.MCP:
                     mcp_tools = run_coroutine(initialize_mcp_tool(tool_cls, tool_config))
+                    tool_list.extend(mcp_tools)
+                case ToolType.AgentCPMMCP:
+                    mcp_tools = run_coroutine(initialize_agentcpm_mcp_tool(tool_cls, tool_config))
                     tool_list.extend(mcp_tools)
                 case _:
                     raise NotImplementedError

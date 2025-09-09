@@ -101,7 +101,9 @@ def default_compute_score(
         from . import search_r1_like_qa_em
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
-
+    elif data_source in ["gaia_dev", "gaia_2023_dev", "gaia"]:
+        from . import gaia
+        res = gaia.compute_score(solution_str, ground_truth)
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 

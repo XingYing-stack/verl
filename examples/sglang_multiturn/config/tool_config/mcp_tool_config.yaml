@@ -6,6 +6,3 @@ tools:
       type: mcp
     mcp:
       mcp_servers_config_path: ./mcp_server.json
-      # optional
-      tool_selected_list: 
-        - tavily_search_tool
