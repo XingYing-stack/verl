@@ -66,6 +66,8 @@ def ppo_loss(config: ActorConfig, model_output, data):
         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
         entropy_coeff = config.entropy_coeff
         policy_loss -= entropy_coeff * entropy_loss
+        # expose entropy loss for logging
+        metrics["entropy_loss"] = entropy_loss.detach().item()
 
     # add kl loss
     if config.use_kl_loss:
@@ -78,4 +80,6 @@ def ppo_loss(config: ActorConfig, model_output, data):
         metrics["kl_loss"] = kl_loss.detach().item()
         metrics["kl_coef"] = config.kl_loss_coef
 
+    # expose final aggregated policy loss (total)
+    metrics["policy_loss"] = policy_loss.detach().item()
     return policy_loss, metrics

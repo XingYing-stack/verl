@@ -25,6 +25,7 @@ from verl.trainer.ppo.metric_utils import (
     bootstrap_metric,
     calc_maj_val,
     compute_data_metrics,
+    compute_rollout_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
@@ -242,6 +243,100 @@ class TestBootstrapMetric(unittest.TestCase):
         with self.assertRaises(ValueError):
             bootstrap_metric([], subset_size=1, reduce_fns=[np.mean])
 
+
+class TestComputeRolloutMetrics(unittest.TestCase):
+    """Tests for the compute_rollout_metrics function."""
+
+    def test_compute_rollout_metrics_basic(self):
+        """Aggregate tool metrics, truncation stats and multi-turn rounds."""
+        # Two requests worth of metrics
+        req1 = {
+            "search": [
+                {"tool_tokens": 10, "truncated": False, "truncation_ratio": 0.2},
+                {"tool_tokens": 6, "truncated": True, "truncation_ratio": 0.8},
+            ],
+            "<rollout>": [{"multi_turn_rounds": 3}],
+        }
+        # Includes non-dict entries which should still be counted as calls
+        req2 = {
+            "search": ["149", "3"],
+            "tavily_search_tool": [
+                {"tool_tokens": 4},
+            ],
+            "<rollout>": [{"multi_turn_rounds": 1}],
+        }
+
+        batch = MagicMock()
+        batch.non_tensor_batch = {
+            "rollout_metrics": np.array([req1, req2], dtype=object),
+        }
+
+        metrics = compute_rollout_metrics(batch)
+
+        # There are 5 tool calls across 2 requests
+        self.assertAlmostEqual(metrics["rollout/avg_tool_calls_per_request"], 5 / 2)
+        # Average tokens per call counted from dict entries only: (10 + 6 + 4) / 5
+        self.assertAlmostEqual(metrics["rollout/avg_tool_tokens_per_call"], 20 / 5)
+        # One truncated among 5 calls
+        self.assertAlmostEqual(metrics["rollout/truncation_rate"], 1 / 5)
+        # Average of provided truncation ratios (0.2, 0.8)
+        self.assertAlmostEqual(metrics["rollout/truncation_ratio_avg"], 0.5)
+        # Multi-turn rounds statistics
+        self.assertAlmostEqual(metrics["rollout/multi_turn_rounds/mean"], 2.0)
+        self.assertEqual(metrics["rollout/multi_turn_rounds/min"], 1.0)
+        self.assertEqual(metrics["rollout/multi_turn_rounds/max"], 3.0)
+
+    def test_compute_rollout_metrics_empty(self):
+        """No rollout_metrics key -> empty dict."""
+        batch = MagicMock()
+        batch.non_tensor_batch = {}
+        metrics = compute_rollout_metrics(batch)
+        self.assertEqual(metrics, {})
+
+
+class TestGroupStdMetrics(unittest.TestCase):
+    """Tests for group std metrics in compute_data_metrics."""
+
+    def _make_batch(self, ids_key: str):
+        batch = MagicMock()
+        # Four samples, two tokens per response
+        batch.batch = {
+            "token_level_scores": torch.tensor(
+                [
+                    [1.0, 2.0],  # sum=3 (group A)
+                    [2.0, 3.0],  # sum=5 (group A) -> std=1.0 within A
+                    [10.0, 10.0],  # sum=20 (group B)
+                    [12.0, 8.0],  # sum=20 (group B) -> std=2.0 within B
+                ]
+            ),
+            "token_level_rewards": torch.ones((4, 2)),
+            "advantages": torch.ones((4, 2)) * 0.1,
+            "returns": torch.ones((4, 2)) * 0.2,
+            "responses": torch.zeros((4, 2)),
+            "attention_mask": torch.ones((4, 4)),  # 2 prompt + 2 response tokens
+            "response_mask": torch.ones((4, 2)),
+            "values": torch.ones((4, 2)) * 0.2,
+        }
+        ids = np.array(["A", "A", "B", "B"], dtype=object)
+        batch.non_tensor_batch = {ids_key: ids}
+        return batch
+
+    def test_group_std_with_uid(self):
+        batch = self._make_batch(ids_key="uid")
+        metrics = compute_data_metrics(batch, use_critic=True)
+        self.assertIn("critic/score/std_group/mean", metrics)
+        # Group A std = 1.0, Group B std = 0.0 -> mean=0.5, min=0.0, max=1.0
+        self.assertAlmostEqual(metrics["critic/score/std_group/mean"], 0.5)
+        self.assertAlmostEqual(metrics["critic/score/std_group/min"], 0.0)
+        self.assertAlmostEqual(metrics["critic/score/std_group/max"], 1.0)
+
+    def test_group_std_with_request_id_fallback(self):
+        batch = self._make_batch(ids_key="request_id")
+        metrics = compute_data_metrics(batch, use_critic=True)
+        self.assertIn("critic/score/std_group/mean", metrics)
+        self.assertAlmostEqual(metrics["critic/score/std_group/mean"], 0.5)
+        self.assertAlmostEqual(metrics["critic/score/std_group/min"], 0.0)
+        self.assertAlmostEqual(metrics["critic/score/std_group/max"], 1.0)
 
 class TestCalcMajVal(unittest.TestCase):
     """Tests for the calc_maj_val function."""

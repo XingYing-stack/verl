@@ -411,27 +411,45 @@ class AsyncRolloutRequest(BaseModel):
         self,
         processing_class: PreTrainedTokenizer | PreTrainedTokenizerFast | ProcessorMixin,
         contents: list[ToolResponse],
-    ) -> None:
+    ) -> int | None:
         if not contents or all(content.is_empty() for content in contents):
-            return
+            return 0
         # We also handle the case when tool returns image
         # We require the processing of the image and video to be done at tool.execute() level
         delta_multi_modal_data = {key: [] for key in self.multi_modal_keys}
         for content in contents:
-            content_list = []
             # When we update multi_model_keys, we also need to update this logic
-            if content.image:
-                content_list.extend([{"type": "image"} for _ in content.image])
+            has_image = bool(content.image)
+            has_video = bool(content.video)
+
+            # Accumulate multi-modal payloads for tokenizer processing later
+            if has_image:
                 delta_multi_modal_data["image"].extend(content.image)
-            if content.video:
-                content_list.extend([{"type": "video"} for _ in content.video])
+            if has_video:
                 delta_multi_modal_data["video"].extend(content.video)
-            if content.text:
-                content_list.append({"type": "text", "text": content.text})
-            self.messages.append(Message(role="tool", content=content_list))
+
+            # Note: treat empty string as a valid text response
+            has_text = content.text is not None
+
+            if not has_image and not has_video and has_text:
+                # Pure text tool response: many tokenizers (e.g., Qwen3) expect
+                # tool messages to carry a string, not a list of parts.
+                self.messages.append(Message(role="tool", content=content.text))
+            else:
+                # Mixed or non-text content: keep the structured parts list so
+                # custom templates can render images/videos correctly.
+                content_list: list[dict] = []
+                if has_image:
+                    content_list.extend([{"type": "image"} for _ in content.image])
+                if has_video:
+                    content_list.extend([{"type": "video"} for _ in content.video])
+                if has_text:
+                    content_list.append({"type": "text", "text": content.text})
+                self.messages.append(Message(role="tool", content=content_list))
 
         messages = [*BASE_CHAT_HISTORY, *self.messages[-len(contents) :]]
         tools = [tool.model_dump() for tool in self.tool_schemas] if self.tool_schemas else None
+        # logger.warning("messages: %s", messages)
 
         for key in self.multi_modal_keys:
             if len(delta_multi_modal_data[key]) > 0:
@@ -447,7 +465,10 @@ class AsyncRolloutRequest(BaseModel):
             tokenize=True,
             return_dict=True,
         )
+        # logger.warning("content_info input_ids: %s", content_info['input_ids'].tolist())
+        # logger.warning("self.base_conv_wo_gen_prompt_end_pos: %d", self.base_conv_wo_gen_prompt_end_pos)
         content_ids = content_info["input_ids"][..., self.base_conv_wo_gen_prompt_end_pos :]
+        # logger.warning("content_ids: %s", content_ids)
 
         # process multi_modal_inputs
         multi_modal_inputs = content_info.copy()
@@ -465,6 +486,9 @@ class AsyncRolloutRequest(BaseModel):
             loss_mask=False,
             new_multi_modal_inputs=multi_modal_inputs,
         )
+
+        # Return total tokens added by all tool messages in this batch
+        return int(content_ids.shape[-1])
 
     def update_metrics(self, metrics: Any, tool_id: str) -> None:
         """

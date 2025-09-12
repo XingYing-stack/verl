@@ -884,8 +884,12 @@ class SGLangRollout(BaseRollout):
                             for tool_call in parsed_tool_calls
                         ]
                     )
-                    _req.add_tool_response_messages(self.processing_class, [resp for resp, _, _ in tool_call_results])
+                    # Add tool responses once and get total added tokens
+                    added_tokens = _req.add_tool_response_messages(
+                        self.processing_class, [resp for resp, _, _ in tool_call_results]
+                    ) or 0
                     for tool_call, (resp, reward, metrics) in zip(parsed_tool_calls, tool_call_results, strict=True):
+                        metrics = {**(metrics or {}), "tool_tokens": int(added_tokens)}
                         _req.update_metrics(metrics, tool_call.function.name)
                     if len(_req.input_ids) >= self.config.max_model_len:
                         finish_reason_type = FinishReasonTypeEnum.STOP
@@ -1025,6 +1029,12 @@ class SGLangRollout(BaseRollout):
         tool_reward_scores = await asyncio.gather(*tool_reward_tasks)
         tool_reward_scores = dict(tool_reward_scores)
         all_rewards = {**tool_reward_scores, **{"user_turn_rewards": user_turn_rewards}}
+        # Log multi-turn assistant rounds
+        try:
+            _req.update_metrics({"multi_turn_rounds": int(current_turns)}, "<rollout>")
+        except Exception:
+            pass
+
         _req.finalize(self.processing_class, all_rewards, finish_reason_type)
         if self.config.calculate_log_probs:
             debug_sampling_params = {**self.sampling_params}
@@ -1334,7 +1344,35 @@ class SGLangRollout(BaseRollout):
             "messages": np.array(messages),
             "reward_scores": np.array(reward_scores),
             "request_id": np.array(request_ids),
+            # Expose per-request metrics to trainer for aggregation/logging
+            "rollout_metrics": np.array([req.metrics for req in sorted_output_req_list], dtype=object),
         }
+
+        # Optional structural assertions to validate rollout metrics for debugging
+        if os.environ.get("VERL_ASSERT_ROLLOUT_METRICS", "") == "1":
+            rm = non_tensor_batch["rollout_metrics"]
+            assert isinstance(rm, np.ndarray), f"rollout_metrics must be np.ndarray, got {type(rm)}"
+            assert rm.dtype == object, f"rollout_metrics dtype must be object, got {rm.dtype}"
+            assert len(rm) == len(sorted_output_req_list), (
+                f"rollout_metrics length {len(rm)} != num_requests {len(sorted_output_req_list)}"
+            )
+            # Per-request validation (dict[str, list[dict|str]])
+            for i, req in enumerate(rm.tolist()):
+                assert isinstance(req, dict), f"rollout_metrics[{i}] must be dict, got {type(req)}"
+                for k, v in req.items():
+                    assert isinstance(k, str), f"rollout_metrics[{i}] key must be str, got {type(k)}"
+                    assert isinstance(v, list), f"rollout_metrics[{i}]['{k}'] must be list, got {type(v)}"
+                    for j, entry in enumerate(v):
+                        assert isinstance(entry, (dict, str)), (
+                            f"rollout_metrics[{i}]['{k}'][{j}] must be dict or str, got {type(entry)}"
+                        )
+                        if isinstance(entry, dict):
+                            if "tool_tokens" in entry:
+                                assert isinstance(entry["tool_tokens"], (int, np.integer))
+                            if "truncated" in entry:
+                                assert isinstance(entry["truncated"], (bool, np.bool_))
+                            if "truncation_ratio" in entry:
+                                assert isinstance(entry["truncation_ratio"], (float, int, np.floating, np.integer))
 
         is_multimodal = isinstance(self.processing_class, ProcessorMixin) and (
             hasattr(self.processing_class, "image_processor") or hasattr(self.model_hf_config, "vision_config")

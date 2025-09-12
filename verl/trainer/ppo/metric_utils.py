@@ -15,17 +15,20 @@
 Metrics related to the PPO trainer.
 """
 
+import os
 from collections import defaultdict
 from functools import partial
 from typing import Any, Callable
 
 import numpy as np
 import torch
+import json, logging, os
 
 from verl import DataProto
 from verl.utils.import_utils import deprecated
 
-
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 @deprecated("verl.utils.metric.reduce_metrics")
 def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     """
@@ -127,6 +130,48 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     score_mean = torch.mean(non_aborted_sequence_score).detach().item()
     score_max = torch.max(non_aborted_sequence_score).detach().item()
     score_min = torch.min(non_aborted_sequence_score).detach().item()
+    # standard deviation of sequence scores (non-aborted only)
+    # use population std (unbiased=False) for stability on small batches
+    score_std = torch.std(non_aborted_sequence_score, unbiased=False).detach().item()
+
+    # Group-wise std by uid (within-query variance)
+    # Compute per-uid std over non-aborted samples, then aggregate mean/min/max
+    group_std_mean = group_std_min = group_std_max = None
+    # Prefer uid; fall back to request_id (from rollout engines) if uid missing
+    id_key = "uid" if "uid" in batch.non_tensor_batch else ("request_id" if "request_id" in batch.non_tensor_batch else None)
+    logger.warning('batch.non_tensor_batch:', batch.non_tensor_batch)
+
+    if id_key is not None:
+        try:
+            uids = batch.non_tensor_batch[id_key]
+            if hasattr(uids, "tolist"):
+                uids = uids.tolist()
+            # gather per-uid scores on non-aborted samples
+            non_aborted_scores_np = non_aborted_sequence_score.detach().cpu().numpy()
+            non_aborted_uids = [uid for uid, keep in zip(uids, non_aborted_mask.tolist(), strict=True) if keep]
+
+            buckets: dict[str, list[float]] = defaultdict(list)
+            for uid, sc in zip(non_aborted_uids, non_aborted_scores_np, strict=True):
+                buckets[str(uid)].append(float(sc))
+
+            per_group_stds = []
+            for vals in buckets.values():
+                if len(vals) <= 1:
+                    per_group_stds.append(0.0)
+                else:
+                    per_group_stds.append(float(np.std(vals, ddof=0)))
+
+            if len(per_group_stds) > 0:
+                arr = np.asarray(per_group_stds, dtype=float)
+                group_std_mean = float(arr.mean())
+                group_std_min = float(arr.min())
+                group_std_max = float(arr.max())
+        except Exception as e:
+            logger.warning('failed to compute bucket statistics', e)
+            # swallow grouping errors silently to avoid breaking training
+            pass
+    else:
+        logger.warning('No id_key')
 
     reward_mean = torch.mean(non_aborted_sequence_reward).detach().item()
     reward_max = torch.max(non_aborted_sequence_reward).detach().item()
@@ -161,6 +206,16 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/score/mean": score_mean,
         "critic/score/max": score_max,
         "critic/score/min": score_min,
+        "critic/score/std": score_std,
+        **(
+            {
+                "critic/score/std_group/mean": group_std_mean,
+                "critic/score/std_group/min": group_std_min,
+                "critic/score/std_group/max": group_std_max,
+            }
+            if group_std_mean is not None
+            else {}
+        ),
         # reward
         "critic/rewards/mean": reward_mean,
         "critic/rewards/max": reward_max,
@@ -222,6 +277,280 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
     return metrics
+
+
+def compute_rollout_metrics(batch: DataProto, aggregate_only: bool | None = None) -> dict:
+    """Aggregate rollout-side metrics for logging.
+
+    Expects `batch.non_tensor_batch["rollout_metrics"]` to be a list-like of per-request
+    metrics dicts collected during rollout. Each dict maps tool_name -> list[metrics_dict]
+    and may include a special key "<rollout>" -> list[{"multi_turn_rounds": int}].
+
+    Returns a flat dict suitable for Tracking.log.
+    """
+    metric_dict: dict[str, float] = {}
+    # Resolve aggregation control: prefer explicit arg; fallback to env; default False
+    if aggregate_only is None:
+        aggregate_only = os.environ.get("VERL_ROLLOUT_METRICS_AGGREGATE_ONLY", "") == "1"
+
+    if "rollout_metrics" not in batch.non_tensor_batch:
+        logger.warning("rollout_metrics not present in batch")
+        return metric_dict
+
+    metrics_list = batch.non_tensor_batch["rollout_metrics"]
+    # Optional structural assertions to debug rollout metrics (enable by setting VERL_ASSERT_ROLLOUT_METRICS=1)
+    if os.environ.get("VERL_ASSERT_ROLLOUT_METRICS", "") == "1":
+        assert hasattr(metrics_list, "tolist") or isinstance(metrics_list, (list, tuple)), (
+            f"rollout_metrics must be a numpy array or list, got {type(metrics_list)}"
+        )
+    # logger.warning('metrics_list:', metrics_list)
+    # Normalize to python list
+    if hasattr(metrics_list, "tolist"):
+        try:
+            metrics_list = metrics_list.tolist()
+        except Exception:
+            metrics_list = list(metrics_list)
+
+    if os.environ.get("VERL_ASSERT_ROLLOUT_METRICS", "") == "1":
+        assert isinstance(metrics_list, list), f"rollout_metrics after tolist() must be list, got {type(metrics_list)}"
+        for i, req_metrics in enumerate(metrics_list):
+            assert isinstance(req_metrics, dict), f"rollout_metrics[{i}] must be dict, got {type(req_metrics)}"
+            for k, v in req_metrics.items():
+                assert isinstance(k, str), f"rollout_metrics[{i}] key must be str, got {type(k)}"
+                assert isinstance(v, list), f"rollout_metrics[{i}]['{k}'] must be list, got {type(v)}"
+                for j, entry in enumerate(v):
+                    assert isinstance(entry, (dict, str)), (
+                        f"rollout_metrics[{i}]['{k}'][{j}] must be dict or str, got {type(entry)}"
+                    )
+                    if isinstance(entry, dict):
+                        # Optional field type checks
+                        if "tool_tokens" in entry:
+                            assert isinstance(entry["tool_tokens"], (int, np.integer)), (
+                                f"tool_tokens must be int, got {type(entry['tool_tokens'])}"
+                            )
+                        if "truncated" in entry:
+                            assert isinstance(entry["truncated"], (bool, np.bool_)), (
+                                f"truncated must be bool, got {type(entry['truncated'])}"
+                            )
+                        if "truncation_ratio" in entry:
+                            assert isinstance(entry["truncation_ratio"], (float, int, np.floating, np.integer)), (
+                                f"truncation_ratio must be number, got {type(entry['truncation_ratio'])}"
+                            )
+
+    total_tool_tokens = 0
+    total_tool_calls = 0
+    trunc_true = 0
+    trunc_ratio_sum = 0.0
+    trunc_ratio_cnt = 0
+    mt_rounds = []
+
+    # Per-tool success/error aggregation (keyed by tool name)
+    per_tool_stats: dict[str, dict[str, Any]] = {}
+    # Global aggregation across all tools (fewer metrics)
+    overall_tool_stats: dict[str, Any] = {
+        "success": 0,
+        "error": 0,
+        "total_eval": 0,
+        "error_types": defaultdict(int),
+    }
+
+    def _sanitize_key(s: str) -> str:
+        # keep alnum, dot; replace others with underscore; limit length
+        return "".join(ch if (ch.isalnum() or ch == ".") else "_" for ch in str(s))[:80]
+
+    saw_any_tool_entry = False
+    for req_metrics in metrics_list:
+        if not isinstance(req_metrics, dict):
+            continue
+        for name, vals in req_metrics.items():
+            if name == "<rollout>":
+                # list of dicts with multi_turn_rounds
+                for v in vals or []:
+                    if isinstance(v, dict) and "multi_turn_rounds" in v:
+                        try:
+                            mt_rounds.append(int(v["multi_turn_rounds"]))
+                        except Exception:
+                            pass
+                continue
+
+            # tool name -> list[metrics]
+            if not isinstance(vals, list):
+                continue
+            for m in vals:
+                # Count every entry as a tool call, even if no metrics dict was provided
+                total_tool_calls += 1
+                saw_any_tool_entry = True
+
+                # Per-tool bucket
+                tool_key = _sanitize_key(name)
+                stats = per_tool_stats.setdefault(tool_key, {
+                    "success": 0,
+                    "error": 0,
+                    "total_eval": 0,
+                    "error_types": defaultdict(int),
+                })
+
+                # Token/truncation counters if dict
+                if isinstance(m, dict):
+                    total_tool_tokens += int(m.get("tool_tokens", 0) or 0)
+                    if m.get("truncated", False):
+                        trunc_true += 1
+                    if "truncation_ratio" in m:
+                        try:
+                            trunc_ratio_sum += float(m["truncation_ratio"])
+                            trunc_ratio_cnt += 1
+                        except Exception:
+                            pass
+
+                # Classify success/failure
+                # - For REST tools (m.tool_kind == 'rest_tool'): default-fail and always count in denominator
+                # - For other tools: previous behavior (only count when status or error present)
+                is_rest = isinstance(m, dict) and m.get("tool_kind") == "rest_tool"
+
+                if is_rest:
+                    # REST: always include in denominator
+                    stats["total_eval"] += 1
+                    overall_tool_stats["total_eval"] += 1
+
+                    success = False
+                    status_raw = m.get("status", "")
+                    status_code = m.get("status_code", None)
+                    try:
+                        code = int(status_code)
+                    except Exception:
+                        code = None
+                    status_ok = (code is not None) and (200 <= code < 300)
+                    status_is_success = str(status_raw).lower() == "success"
+                    if status_is_success and status_ok:
+                        success = True
+
+                    if success:
+                        stats["success"] += 1
+                        overall_tool_stats["success"] += 1
+                    else:
+                        stats["error"] += 1
+                        overall_tool_stats["error"] += 1
+                        # determine error type label
+                        err_label = "unknown"
+                        if m.get("error"):
+                            err_label = _sanitize_key(str(m["error"]).split("\n", 1)[0])
+                        else:
+                            if m.get("status_code") is not None:
+                                try:
+                                    err_label = f"http:{int(m['status_code'])}"
+                                except Exception:
+                                    err_label = f"status:{_sanitize_key(str(m.get('status', '')))}"
+                            elif m.get("detail"):
+                                err_label = _sanitize_key(f"detail:{str(m['detail'])[:120]}")
+                            elif m.get("status"):
+                                err_label = _sanitize_key(f"status:{str(m['status'])}")
+                        stats["error_types"][err_label] += 1
+                        overall_tool_stats["error_types"][err_label] += 1
+                else:
+                    # Non-REST: only count when status or error present
+                    if isinstance(m, dict):
+                        err = m.get("error", None)
+                        if err is not None and str(err) != "":
+                            stats["error"] += 1
+                            stats["total_eval"] += 1
+                            overall_tool_stats["error"] += 1
+                            overall_tool_stats["total_eval"] += 1
+                            err_label = _sanitize_key(str(err).split("\n", 1)[0])
+                            stats["error_types"][err_label] += 1
+                            overall_tool_stats["error_types"][err_label] += 1
+                        else:
+                            status_raw = m.get("status", "") if "status" in m else ""
+                            status = str(status_raw).lower()
+                            if status != "":
+                                # Prefer HTTP-like numeric status when available
+                                ok = False
+                                try:
+                                    code = int(str(status_raw))
+                                    ok = 200 <= code < 400
+                                except Exception:
+                                    ok_set = {"success", "ok", "succeeded", "200", "true"}
+                                    ok = status in ok_set
+                                if ok:
+                                    stats["success"] += 1
+                                    overall_tool_stats["success"] += 1
+                                else:
+                                    stats["error"] += 1
+                                    err_label = _sanitize_key(f"status:{status}")
+                                    stats["error_types"][err_label] += 1
+                                    overall_tool_stats["error"] += 1
+                                    overall_tool_stats["error_types"][err_label] += 1
+                                stats["total_eval"] += 1
+                                overall_tool_stats["total_eval"] += 1
+
+    num_reqs = max(1, len(metrics_list))
+    # Averages instead of totals
+    if total_tool_calls > 0:
+        metric_dict["rollout/avg_tool_tokens_per_call"] = float(total_tool_tokens) / float(total_tool_calls)
+        metric_dict["rollout/avg_tool_calls_per_request"] = float(total_tool_calls) / float(num_reqs)
+        metric_dict["rollout/truncation_rate"] = float(trunc_true) / float(total_tool_calls)
+        if trunc_ratio_cnt > 0:
+            metric_dict["rollout/truncation_ratio_avg"] = trunc_ratio_sum / float(trunc_ratio_cnt)
+
+    if len(mt_rounds) > 0:
+        mt_arr = np.array(mt_rounds)
+        metric_dict["rollout/multi_turn_rounds/mean"] = float(mt_arr.mean())
+        metric_dict["rollout/multi_turn_rounds/min"] = float(mt_arr.min())
+        metric_dict["rollout/multi_turn_rounds/max"] = float(mt_arr.max())
+
+    # Emit per-tool success/error ratios and error-type breakdown (can be disabled via env)
+    if not aggregate_only:
+        for tool_name, stats in per_tool_stats.items():
+            tot = int(stats.get("total_eval", 0))
+            if tot <= 0:
+                continue
+            succ = int(stats.get("success", 0))
+            errc = int(stats.get("error", 0))
+            prefix = f"rollout/tools/{tool_name}"
+            metric_dict[f"{prefix}/success_ratio"] = succ / float(tot)
+            metric_dict[f"{prefix}/error_ratio"] = errc / float(tot)
+            metric_dict[f"{prefix}/success_count"] = succ
+            metric_dict[f"{prefix}/error_count"] = errc
+
+            # top-5 error types by count
+            error_types: dict[str, int] = stats.get("error_types", {})
+            if isinstance(error_types, defaultdict):
+                error_types = dict(error_types)
+            if error_types:
+                top = sorted(error_types.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                for etype, cnt in top:
+                    etype_pref = f"{prefix}/error_type/{etype}"
+                    metric_dict[f"{etype_pref}/count"] = int(cnt)
+                    metric_dict[f"{etype_pref}/ratio"] = int(cnt) / float(tot)
+
+    # Emit overall aggregated tool success/error and error types (always on)
+    tot_overall = int(overall_tool_stats.get("total_eval", 0))
+    if tot_overall > 0:
+        succ_overall = int(overall_tool_stats.get("success", 0))
+        err_overall = int(overall_tool_stats.get("error", 0))
+        prefix = "rollout/tools_overall"
+        metric_dict[f"{prefix}/success_ratio"] = succ_overall / float(tot_overall)
+        metric_dict[f"{prefix}/error_ratio"] = err_overall / float(tot_overall)
+        metric_dict[f"{prefix}/success_count"] = succ_overall
+        metric_dict[f"{prefix}/error_count"] = err_overall
+
+        error_types_overall: dict[str, int] = overall_tool_stats.get("error_types", {})
+        if isinstance(error_types_overall, defaultdict):
+            error_types_overall = dict(error_types_overall)
+        if error_types_overall:
+            top = sorted(error_types_overall.items(), key=lambda kv: kv[1], reverse=True)[:10]
+            for etype, cnt in top:
+                etype_pref = f"{prefix}/error_type/{etype}"
+                metric_dict[f"{etype_pref}/count"] = int(cnt)
+                metric_dict[f"{etype_pref}/ratio"] = int(cnt) / float(tot_overall)
+
+
+    # Final assertion to catch silent drops: if there were tool entries, expect some rollout/* outputs
+    if os.environ.get("VERL_ASSERT_ROLLOUT_METRICS", "") == "1" and len(metrics_list) > 0 and saw_any_tool_entry:
+        assert any(k.startswith("rollout/") for k in metric_dict.keys()), (
+            "compute_rollout_metrics produced no rollout/* keys despite tool entries; check rollout_metrics wiring"
+        )
+
+    return metric_dict
 
 
 def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> dict[str, Any]:

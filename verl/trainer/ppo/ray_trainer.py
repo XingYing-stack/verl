@@ -47,6 +47,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
+    compute_rollout_metrics,
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
@@ -1209,10 +1210,22 @@ class RayPPOTrainer:
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                # rollout metrics aggregation (tools tokens, truncation stats, multi-turn rounds)
+                # The per-tool detail can be reduced using trainer.rollout_metrics.aggregate_only=True
+                agg_only = False
+                try:
+                    rm_cfg = getattr(self.config.trainer, "rollout_metrics", None)
+                    if rm_cfg is not None:
+                        if isinstance(rm_cfg, dict):
+                            agg_only = bool(rm_cfg.get("aggregate_only", False))
+                        else:
+                            agg_only = bool(getattr(rm_cfg, "aggregate_only", False))
+                except Exception:
+                    pass
+                metrics.update(compute_rollout_metrics(batch=batch, aggregate_only=agg_only))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)

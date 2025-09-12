@@ -490,6 +490,11 @@ class DataParallelPPOActor(BasePPOActor):
                             "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                         }
                     )
+                    # Log entropy loss if enabled
+                    if entropy_coeff != 0:
+                        micro_batch_metrics["actor/entropy_loss"] = entropy_loss.detach().item() * loss_scale_factor
+                    # Log aggregated policy loss (total loss for PPO/GRPO actor)
+                    micro_batch_metrics["actor/policy_loss"] = policy_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()

@@ -21,6 +21,15 @@ class RESTMCPTool(BaseTool):
         super().__init__(config, tool_schema)
         self._instance_dict = {}
         self.timeout = config.get("timeout", 30)
+        # Character-based truncation only (simple, no tokenizer required)
+        self.max_text_length: Optional[int] = config.get("max_text_length")
+
+    def _truncate_text(self, text: str) -> tuple[str, bool]:
+        """Truncate tool text by characters. Returns (new_text, truncated_flag)."""
+        if isinstance(self.max_text_length, int) and self.max_text_length > 0:
+            if len(text) > self.max_text_length:
+                return text[: self.max_text_length] + "\n...[truncated]", True
+        return text, False
 
     async def create(self, instance_id: Optional[str] = None, **kwargs) -> tuple[str, ToolResponse]:
         if instance_id is None:
@@ -39,9 +48,34 @@ class RESTMCPTool(BaseTool):
 
         mgr: RESTManager = RESTMCPTool._rest_manager
         result = await mgr.call_tool(self.name, parameters, timeout=self.timeout)
-        # 我们把原始 JSON 压成字符串返回（保持 execute 返回文本）
-        # 也可在此解析结构，提纯你要的字段
-        return (result.content[0].text if result.content else ""), {"status": result.status}
+        # 规范化状态：优先使用 payload.status/status_code；否则退回 result.status
+        status_val = result.status if hasattr(result, "status") else "unknown"
+        status_code = None
+        detail = None
+        raw = getattr(result, "raw", None)
+        if isinstance(raw, dict):
+            if raw.get("status") is not None:
+                status_val = str(raw.get("status"))
+            if raw.get("status_code") is not None:
+                try:
+                    status_code = int(raw.get("status_code"))
+                    status_val = str(status_code)
+                except Exception:
+                    status_val = str(raw.get("status_code"))
+            if raw.get("detail"):
+                try:
+                    detail = str(raw.get("detail"))
+                except Exception:
+                    detail = None
+
+        meta = {"status": status_val}
+        if status_code is not None:
+            meta["status_code"] = status_code
+        if detail:
+            meta["detail"] = detail
+
+        # 返回文本与元信息
+        return (result.content[0].text if result.content else ""), meta
 
     @rollout_trace_op
     async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float, dict]:
@@ -52,8 +86,38 @@ class RESTMCPTool(BaseTool):
 
         try:
             text, meta = await self._call(instance_id, parameters)
+            orig_len = len(text)
+            text, truncated = self._truncate_text(text)
+            final_len = len(text)
+            ratio = (final_len / orig_len) if orig_len > 0 else 1.0
             self._instance_dict[instance_id]["reward"].append(text.strip())
-            metrics = {"status": meta.get("status", "unknown")}
+            # 判定是否失败：优先使用显式 status_code >= 400；否则 status 不在 ok_set
+            status_str = str(meta.get("status", ""))
+            status_code = meta.get("status_code", None)
+            ok_set = {"success", "ok", "succeeded", "200", "true"}
+            is_error = False
+            if isinstance(status_code, int):
+                is_error = status_code >= 400
+            elif status_str != "":
+                is_error = status_str.lower() not in ok_set
+
+            metrics = {
+                # 仅用于聚合层识别为 REST 工具，不做额外分桶输出
+                "tool_kind": "rest_tool",
+                "status": status_str,
+                "truncated": truncated,
+                "tool_text_len": final_len,
+                "tool_text_len_orig": orig_len,
+                "truncation_ratio": ratio,
+            }
+            if is_error:
+                # 填充 error 字段，方便聚合层将其计为失败并归类
+                if isinstance(status_code, int):
+                    metrics["error"] = f"http:{status_code}"
+                elif meta.get("detail"):
+                    metrics["error"] = f"detail:{meta['detail'][:200]}"
+                else:
+                    metrics["error"] = f"status:{status_str}"
             return ToolResponse(text=text), 0.0, metrics
         except Exception as e:
             err = json.dumps({"error": f"Tool exec failed: {e}"}, ensure_ascii=False)

@@ -2,12 +2,15 @@
 # make sure your current working directory is the root of the project
 
 set -x
-
+export LOGLEVEL=DEBUG
 ulimit -n 65535
+
+
+export VERL_ASSERT_ROLLOUT_METRICS=1
 
 PROJECT_DIR="$(pwd)"
 CONFIG_PATH="$PROJECT_DIR/examples/sglang_multiturn/config"
-
+experiment_name="qwen3-8b_function_rm-gaia_dev-sgl-multi-w-tool-verify-n4-agentcpm"
 python3 -m verl.trainer.main_ppo \
     --config-path="$CONFIG_PATH" \
     --config-name='gaia_dev_multiturn_grpo' \
@@ -43,12 +46,15 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","swanlab"]' \
     trainer.project_name='gaia_dev_async_rl' \
-    trainer.experiment_name='qwen3-8b_function_rm-gaia_dev-sgl-multi-w-tool-verify-n4-agentcpm' \
+    trainer.experiment_name=$experiment_name \
+    trainer.validation_data_dir="/share_data/data1/fanshengda/zero_deep_research/rollout_data/$experiment_name-validation" \
+    trainer.rollout_data_dir="/share_data/data1/fanshengda/zero_deep_research/rollout_data/$experiment_name-train" \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.val_before_train=True \
     trainer.save_freq=-1 \
     trainer.test_freq=20 \
+    +trainer.rollout_metrics.aggregate_only=False \
     data.train_files=$HOME/data/gaia_dev/dev.parquet \
     data.val_files=$HOME/data/gaia_dev/dev.parquet \
     actor_rollout_ref.rollout.multi_turn.tool_config_path="$PROJECT_DIR/examples/sglang_multiturn/config/tool_config/agentcpm_mcp_tool_config.yaml" \
