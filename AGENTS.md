@@ -1,41 +1,32 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- Source code: `verl/` (core library), version at `verl/version/version`.
-- Tests: `tests/` (pytest), special sanity checks in `tests/special_sanity/`.
-- Examples & recipes: `examples/`, `recipe/`.
-- Tooling & scripts: `scripts/` (e.g., `generate_trainer_config.sh`).
-- Docs & site: `docs/` (Sphinx), Docker assets in `docker/`.
+- Core library lives in `verl/`; version string stored in `verl/version/version`.
+- Pytest suites reside in `tests/` with targeted checks under `tests/special_sanity/`.
+- Example code and runnable recipes sit in `examples/` and `recipe/`; scripts (e.g., `generate_trainer_config.sh`) are under `scripts/`.
+- Documentation is built from `docs/`; container assets are found in `docker/`.
 
 ## Build, Test, and Development Commands
-- Install (editable) with extras:
-  - `pip install -e .[test]` (core dev + tests)
-  - `pip install -e .[test,vllm]` or `.[test,sglang]` for engine-specific work
-- Run tests: `pytest -q` (GPU-heavy tests auto-skip if unsupported). Example: `pytest tests/utils/test_torch_functional.py::test_allreduce -q`.
-- Lint/format/type-check via pre-commit:
-  - `pre-commit install`
-  - `pre-commit run --all-files`
-  - Common hooks: `ruff`, `ruff-format`, `mypy`, `autogen-trainer-cfg`, docstrings/license checks.
-- Build docs:
-  - `pip install -r docs/requirements-docs.txt`
-  - `make -C docs html`
+- `pip install -e .[test]` installs editable dependencies for local dev and pytest.
+- `pytest -q` runs the CPU-friendly suite; select cases via `pytest tests/path::test_name -q`.
+- `pre-commit run --all-files` applies `ruff`, `ruff-format`, `mypy`, and trainer config checks.
+- `make -C docs html` builds the Sphinx docs after `pip install -r docs/requirements-docs.txt`.
 
 ## Coding Style & Naming Conventions
-- Python, 4-space indent, line length 120 (ruff).
-- Use type hints where practical; mypy configured with selective overrides.
-- Naming: `snake_case` for functions/modules, `PascalCase` for classes, `UPPER_CASE` for constants.
-- Keep imports sorted (ruff/isort). Prefer explicit exports over wildcard except where justified by config.
+- Python code uses 4-space indents, line length 120, and explicit type hints when practical.
+- Follow `snake_case` for modules/functions, `PascalCase` for classes, and `UPPER_CASE` for constants.
+- Keep imports sorted; rely on `ruff` hooks for linting and formatting enforcement.
 
 ## Testing Guidelines
-- Framework: `pytest` (+ `pytest-asyncio` via `[test]`).
-- Place tests under `tests/`; name files `test_*.py`; use `parametrize` and `asyncio` markers as needed.
-- Resource-dependent tests should skip cleanly (see existing `@pytest.mark.skipif` patterns and envs like `SANDBOX_FUSION_URL`).
+- Tests must live under `tests/` and be named `test_*.py`; mark resource-heavy cases to skip gracefully (see existing `@pytest.mark.skipif`).
+- Use `pytest-asyncio` fixtures as needed and keep parametrized coverage for model variants.
+- Before submitting, run `pytest -q`; document any skipped GPU-dependent checks in the PR notes.
 
 ## Commit & Pull Request Guidelines
-- Commit style: `[scope] type: summary`, imperative mood. Examples: `[trainer] fix: handle None states`, `[sglang] feat: add native server`.
-- Link issues in body (e.g., `Fixes #123`). Keep commits focused.
-- PRs must include: clear description, rationale, testing notes (CPU/GPU/local), config changes, and doc updates if user-facing. Ensure pre-commit passes and CI is green.
+- Commit messages follow `[scope] type: summary` (e.g., `[trainer] fix: handle None states`). Link related issues in the body (`Fixes #123`).
+- PRs should explain rationale, note testing (CPU/GPU/local), mention config or doc updates, and ensure `pre-commit` passes.
+- Regenerate trainer configs with `scripts/generate_trainer_config.sh` when touching `verl/trainer/config/`.
 
-## Tips & Notes
-- Trainer configs live under `verl/trainer/config/`; regenerate generated YAML via `scripts/generate_trainer_config.sh` (runs in pre-commit).
-- Do not commit secrets or large datasets. Use environment variables and `.gitignore`d paths for local data.
+## Security & Configuration Tips
+- Never commit secrets or datasets; rely on environment variables and `.gitignore`d paths.
+- Validate new trainer settings locally before sharing, and document required env vars in PR descriptions.

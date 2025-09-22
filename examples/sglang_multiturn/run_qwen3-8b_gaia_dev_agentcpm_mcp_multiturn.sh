@@ -54,8 +54,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=True \
     trainer.save_freq=-1 \
     trainer.test_freq=20 \
-    +trainer.rollout_metrics.aggregate_only=False \
-    data.train_files=$HOME/data/gaia_dev/dev.parquet \
-    data.val_files=$HOME/data/gaia_dev/dev.parquet \
+    +trainer.rollout_metrics.aggregate_only=True \
+    data.train_files=$HOME/data/gaia_dev/dev_18080_0915.parquet \
+    data.val_files=$HOME/data/gaia_dev/dev_18080_0915.parquet \
     actor_rollout_ref.rollout.multi_turn.tool_config_path="$PROJECT_DIR/examples/sglang_multiturn/config/tool_config/agentcpm_mcp_tool_config.yaml" \
     trainer.total_epochs=15 $@
