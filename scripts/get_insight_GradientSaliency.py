@@ -36,115 +36,6 @@ from typing import List, Dict, Any
 import types, threading
 import torch
 
-# 1) 兼容导入（Qwen3 优先，退化到 Qwen2）
-try:
-    import transformers.models.qwen3.modeling_qwen3 as qwen_mod
-except Exception:
-    import transformers.models.qwen2.modeling_qwen2 as qwen_mod
-
-# 原函数备份
-_ORIG_APPLY_ROPE = qwen_mod.apply_rotary_pos_emb
-
-# 线程本地状态：当前 attention 的 layer_idx（由轻量 forward 包装写入）
-_tls = threading.local()
-_tls.layer_idx = None
-
-class QKCache:
-    def __init__(self, keep_all_layers=False, target_last_layer=None):
-        self.q = []   # list of (layer_idx, tensor[B,H,T,Dh])
-        self.k = []
-        self.keep_all_layers = keep_all_layers
-        self.target_last_layer = target_last_layer  # 若给出，只保留等于该层号的
-    def _accept(self, layer_idx):
-        if self.keep_all_layers:
-            return True
-        if self.target_last_layer is None:
-            return True
-        return layer_idx == self.target_last_layer
-
-def _to_bhtd(x):
-    # 统一到 [B,H,T,Dh]
-    if x.dim() == 4:
-        # 常见是 [B, H, T, Dh] 或 [B, T, H, Dh]
-        if x.shape[1] <= 256 and x.shape[2] >= 1 and x.shape[1] != x.shape[2]:
-            # 猜测 [B,H,T,Dh]
-            return x
-        # 认为 [B,T,H,Dh]
-        return x.permute(0, 2, 1, 3).contiguous()
-    elif x.dim() == 3:
-        # [B, T, H*Dh]
-        B,T,D = x.shape
-        # 无法知道 H，只能不动；HF 调用 apply_rope 通常已是 4D
-        raise RuntimeError(f"Unexpected 3D shape at apply_rope: {x.shape}")
-    raise RuntimeError(f"Unexpected rank at apply_rope: {x.shape}")
-
-def make_patcher(cache: QKCache):
-    """
-    返回两个可调用对象：patch() / restore()
-    - patch(): 猴补 apply_rotary_pos_emb + 轻量 forward 包装（仅写 layer_idx）
-    - restore(): 复原
-    """
-    originals = {"apply": _ORIG_APPLY_ROPE}
-    forward_wrapped = []
-
-    def wrapped_apply(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-        # 调原实现
-        q_rope, k_rope = originals["apply"](q, k, cos, sin, position_ids, unsqueeze_dim)
-        try:
-            layer_idx = getattr(_tls, "layer_idx", None)
-            if cache._accept(layer_idx):
-                cache.q.append((layer_idx, _to_bhtd(q_rope.detach())))
-                cache.k.append((layer_idx, _to_bhtd(k_rope.detach())))
-        except Exception:
-            # 静默失败，不影响正常前向
-            pass
-        return q_rope, k_rope
-
-    def wrap_forward(mod_cls):
-        """
-        只包一层最小逻辑：在进入 attention.forward 前把 layer_idx 写到 thread-local，
-        退出时清空。签名完全不改，兼容未来版本。
-        """
-        orig_fwd = mod_cls.forward
-        def fwd(self, *args, **kwargs):
-            prev = getattr(_tls, "layer_idx", None)
-            try:
-                # 大多实现会把 layer_idx 挂在 attention 或 decoder layer 上
-                _tls.layer_idx = getattr(self, "layer_idx", getattr(getattr(self, "config", None), "layer_idx", None))
-                return orig_fwd(self, *args, **kwargs)
-            finally:
-                _tls.layer_idx = prev
-        mod_cls.forward = fwd
-        forward_wrapped.append((mod_cls, orig_fwd))
-
-    def patch():
-        # 1) 猴补 apply_rotary_pos_emb（模块级自由函数）
-        qwen_mod.apply_rotary_pos_emb = wrapped_apply
-
-        # 2) 找到所有 Attention 类，把 forward 轻量包一下（只写 layer_idx）
-        # Qwen3: Qwen3Attention；Qwen2: Qwen2Attention
-        # 有些分支会把名字改掉；稳妥些：挑选带有 q_proj/k_proj 且有 head 维度配置的模块
-        candidates = []
-        for name, obj in qwen_mod.__dict__.items():
-            if not isinstance(obj, type):
-                continue
-            nm = name.lower()
-            if ("attention" in nm) and hasattr(obj, "forward"):
-                candidates.append(obj)
-        for cls in candidates:
-            wrap_forward(cls)
-
-    def restore():
-        # 还原自由函数
-        qwen_mod.apply_rotary_pos_emb = originals["apply"]
-        # 还原 forward
-        for cls, orig in forward_wrapped:
-            cls.forward = orig
-        forward_wrapped.clear()
-
-    return patch, restore
-
-
 
 def to_openai_messages(conversations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -284,375 +175,6 @@ import torch
 import torch.nn.functional as F
 
 import torch
-
-@torch.no_grad()
-def accumulate_last_layer_stats_noTT_turns(
-    q_last: torch.Tensor,  # [1,Hq,T,Dh]
-    k_last: torch.Tensor,  # [1,Hkv,T,Dh]
-    turns: Dict[str, List[List[Tuple[int,int]]]],
-    g_abs: torch.Tensor | None = None,  # [T]
-    alpha: float = 1.0,
-    chunk_cols: int = 1024,
-    causal: bool = True,
-):
-    """
-    与 credit_from_attn_matrix_turns 同公式，但用 QK 流式重算最后一层注意力的“行”，仅累计所需的列和。
-    - 查询行（rows）：始终取 assistant 的行集合
-    - 被查询列（cols）：这一轮的 assistant∪tool
-    返回：s: [K], A: [K,K]（上三角 j<k）
-    """
-    device = q_last.device
-    q = q_last[0]  # [Hq,T,Dh]
-    k = k_last[0]  # [Hkv,T,Dh]
-    Hq, T, Dh = q.shape
-    Hkv = k.shape[0]
-    scale = (Dh ** -0.5)
-
-    # GQA：把 K/V 头复制到 Q 头数
-    assert Hq % Hkv == 0
-    group = Hq // Hkv
-    k_for_q = k.repeat_interleave(group, dim=0)  # [Hq,T,Dh]
-
-    if g_abs is None:
-        g_abs = torch.ones(T, device=device, dtype=torch.float32)
-    else:
-        g_abs = g_abs.to(device=device, dtype=torch.float32)
-        assert g_abs.shape[0] == T
-
-    asst_turns = turns["assistant_turns"][0]
-    tool_turns = turns.get("tool_turns", [[]])[0] if turns.get("tool_turns", None) else []
-    K = len(asst_turns)
-    assert K >= 1
-
-    # 构建列掩码 C_k、行掩码 A_k
-    mask_A = [torch.zeros(T, dtype=torch.bool, device=device) for _ in range(K)]
-    mask_C = [torch.zeros(T, dtype=torch.bool, device=device) for _ in range(K)]
-    for k_idx in range(K):
-        s_k, e_k = asst_turns[k_idx]
-        if e_k > s_k:
-            mask_A[k_idx][s_k:e_k] = True
-            mask_C[k_idx][s_k:e_k] = True
-        if k_idx < len(tool_turns):
-            st, et = tool_turns[k_idx]
-            if et > st:
-                mask_C[k_idx][st:et] = True
-
-    # 预先把每个块内各轮的列索引存起来（相对索引，避免重复构造）
-    n_blocks = (T + chunk_cols - 1) // chunk_cols
-    cols_rel = [[None]*n_blocks for _ in range(K)]
-    for b in range(n_blocks):
-        c0, c1 = b*chunk_cols, min(T, (b+1)*chunk_cols)
-        cols_full = torch.arange(c0, c1, device=device)
-        for k_idx in range(K):
-            sel = mask_C[k_idx][c0:c1]  # [C] bool
-            rel = cols_full[sel] - c0
-            cols_rel[k_idx][b] = rel
-
-    # ---- s_attn：答案行 = 最后一轮 assistant 的行 ----
-    s_attn = torch.zeros(K, device=device, dtype=torch.float32)
-    s_I    = torch.zeros(K, device=device, dtype=torch.float32) if alpha < 1.0 else None
-
-    sL, eL = asst_turns[-1]
-    rows_ans = torch.arange(sL, eL, device=device)
-    Ta = int(rows_ans.numel())
-    assert Ta > 0
-
-    # 两遍流式 softmax（仅对答案行）
-    q_ans = q[:, rows_ans, :]  # [Hq,Ta,Dh]
-    row_max = torch.full((Hq, Ta), -float("inf"), device=device)
-    for b in range(n_blocks):
-        c0, c1 = b*chunk_cols, min(T, (b+1)*chunk_cols)
-        k_blk = k_for_q[:, c0:c1, :]                                  # [Hq,C,Dh]
-        scores = torch.einsum("hAd,hCd->hAC", q_ans, k_blk) * scale   # [Hq,Ta,C]
-        if causal:
-            cols = torch.arange(c0, c1, device=device).view(1,1,-1)
-            rpos = rows_ans.view(1,-1,1)
-            scores = scores.masked_fill(cols > rpos, float("-inf"))
-        row_max = torch.maximum(row_max, scores.max(dim=-1).values)
-
-    row_sumexp = torch.zeros(Hq, Ta, device=device)
-    for b in range(n_blocks):
-        c0, c1 = b*chunk_cols, min(T, (b+1)*chunk_cols)
-        k_blk = k_for_q[:, c0:c1, :]
-        scores = torch.einsum("hAd,hCd->hAC", q_ans, k_blk) * scale
-        if causal:
-            cols = torch.arange(c0, c1, device=device).view(1,1,-1)
-            rpos = rows_ans.view(1,-1,1)
-            scores = scores.masked_fill(cols > rpos, float("-inf"))
-        exp_blk = torch.exp(scores - row_max.unsqueeze(-1))           # [Hq,Ta,C]
-        row_sumexp += exp_blk.sum(dim=-1)
-
-    inv_denom = 1.0 / (row_sumexp + 1e-12)
-
-    # 第三遍：按块把 Σ_{t∈A_last} A[t,·] 累计出来（先 head-mean 再行求和）
-    sum_last_cols = torch.zeros(T, device=device, dtype=torch.float32)
-    for b in range(n_blocks):
-        c0, c1 = b*chunk_cols, min(T, (b+1)*chunk_cols)
-        C = c1 - c0
-        k_blk = k_for_q[:, c0:c1, :]
-        scores = torch.einsum("hAd,hCd->hAC", q_ans, k_blk) * scale
-        if causal:
-            cols = torch.arange(c0, c1, device=device).view(1,1,-1)
-            rpos = rows_ans.view(1,-1,1)
-            scores = scores.masked_fill(cols > rpos, float("-inf"))
-        exp_blk = torch.exp(scores - row_max.unsqueeze(-1))
-        attn_blk = exp_blk * inv_denom.unsqueeze(-1)                  # [Hq,Ta,C]
-        A_blk_mean = attn_blk.mean(dim=0)                             # [Ta,C]
-        sum_last_cols[c0:c1] += A_blk_mean.sum(dim=0)                 # [C] 累到全局
-
-    for k_idx in range(K):
-        for b in range(n_blocks):
-            rel = cols_rel[k_idx][b]
-            if rel.numel() == 0:
-                continue
-            c0 = b*chunk_cols
-            sum_cols = sum_last_cols[c0:c0+rel.numel()*0 + (chunk_cols if c0+chunk_cols<=T else T-c0)]  # 不用这个值，避免误会
-            # 直接索引相对列
-            s_attn[k_idx] += (sum_last_cols[c0:c0+chunk_cols].index_select(0, rel) *
-                              g_abs[c0:c0+chunk_cols].index_select(0, rel)).sum()
-
-    if alpha < 1.0:
-        inter_last = mask_A[-1]  # [T]
-        for k_idx in range(K):
-            inter = inter_last & mask_C[k_idx]
-            if inter.any():
-                s_I[k_idx] = g_abs[inter].sum()
-
-    # ---- A_attn：对子回合 k 的 assistant 行求和；父列用 C_j ----
-    A_attn = torch.zeros(K, K, device=device, dtype=torch.float32)
-    A_I    = torch.zeros(K, K, device=device, dtype=torch.float32) if alpha < 1.0 else None
-
-    for k_idx in range(K):
-        rows_k = mask_A[k_idx]
-        Tk = int(rows_k.sum().item())
-        if Tk == 0:
-            continue
-        q_k = q[:, rows_k, :]                                        # [Hq,Tk,Dh]
-
-        # 两遍：行最大值、分母
-        row_max = torch.full((Hq, Tk), -float("inf"), device=device)
-        rows_idx = torch.nonzero(rows_k, as_tuple=False).squeeze(-1)
-        for b in range(n_blocks):
-            c0, c1 = b*chunk_cols, min(T, (b+1)*chunk_cols)
-            k_blk = k_for_q[:, c0:c1, :]
-            scores = torch.einsum("hkd,hcd->hkc", q_k, k_blk) * scale
-            if causal:
-                cols = torch.arange(c0, c1, device=device).view(1,1,-1)
-                rpos = rows_idx.view(1,-1,1)
-                scores = scores.masked_fill(cols > rpos, float("-inf"))
-            row_max = torch.maximum(row_max, scores.max(dim=-1).values)
-
-        row_sumexp = torch.zeros(Hq, Tk, device=device)
-        for b in range(n_blocks):
-            c0, c1 = b*chunk_cols, min(T, (b+1)*chunk_cols)
-            k_blk = k_for_q[:, c0:c1, :]
-            scores = torch.einsum("hkd,hcd->hkc", q_k, k_blk) * scale
-            if causal:
-                cols = torch.arange(c0, c1, device=device).view(1,1,-1)
-                rpos = rows_idx.view(1,-1,1)
-                scores = scores.masked_fill(cols > rpos, float("-inf"))
-            exp_blk = torch.exp(scores - row_max.unsqueeze(-1))
-            row_sumexp += exp_blk.sum(dim=-1)
-
-        inv_denom = 1.0 / (row_sumexp + 1e-12)
-
-        # 第三遍：写 Σ_{i'∈A_k} A[i',·]
-        sum_child_cols = torch.zeros(T, device=device, dtype=torch.float32)
-        for b in range(n_blocks):
-            c0, c1 = b*chunk_cols, min(T, (b+1)*chunk_cols)
-            k_blk = k_for_q[:, c0:c1, :]
-            scores = torch.einsum("hkd,hcd->hkc", q_k, k_blk) * scale
-            if causal:
-                cols = torch.arange(c0, c1, device=device).view(1,1,-1)
-                rpos = rows_idx.view(1,-1,1)
-                scores = scores.masked_fill(cols > rpos, float("-inf"))
-            exp_blk = torch.exp(scores - row_max.unsqueeze(-1))
-            attn_blk = exp_blk * inv_denom.unsqueeze(-1)             # [Hq,Tk,C]
-            A_blk_mean = attn_blk.mean(dim=0)                        # [Tk,C]
-            sum_child_cols[c0:c1] += A_blk_mean.sum(dim=0)
-
-        # 聚合到 A_attn[:, k_idx]（父列用 C_j）
-        for j_idx in range(k_idx):
-            val = 0.0
-            for b in range(n_blocks):
-                rel = cols_rel[j_idx][b]
-                if rel.numel() == 0:
-                    continue
-                c0 = b*chunk_cols
-                val += (sum_child_cols[c0:c0+chunk_cols].index_select(0, rel) *
-                        g_abs[c0:c0+chunk_cols].index_select(0, rel)).sum()
-            A_attn[j_idx, k_idx] = val
-
-            if alpha < 1.0:
-                inter = mask_A[k_idx] & mask_C[j_idx]
-                if inter.any():
-                    A_I[j_idx, k_idx] = g_abs[inter].sum()
-
-    s_final = (alpha * s_attn) if alpha == 1.0 else (alpha * s_attn + (1.0 - alpha) * s_I)
-    A_final = (alpha * A_attn) if alpha == 1.0 else (alpha * A_attn + (1.0 - alpha) * A_I)
-
-    return s_final, A_final
-
-@torch.no_grad()
-def credit_from_attn_matrix_turns(
-    attn_last: torch.Tensor,                 # [B, H, T, T] 最后一层各 head 注意力（已 softmax & causal）
-    turns_list: List[Dict[str, List[List[Tuple[int,int]]]]],  # len=B；每个元素：{'assistant_turns': [[(s,e),...]], 'tool_turns': [[(s,e),...]]}
-    g_abs_list: List[torch.Tensor] | None = None,  # len=B；每个样本的 |g_i|, shape [T]
-    alpha: float = 1.0,
-):
-    """
-    计算：
-      s[k]      = Σ_{t∈A_last} Σ_{i∈C_k} A[t,i] |g_i|
-      A[j,k]    = Σ_{i'∈A_k}   Σ_{i∈C_j} A[i',i] |g_i|, 仅 j<k
-    其中 A_k 是第 k 轮 assistant 的 token 区间；C_k := A_k ∪ (tool_k), 若最后一轮无 tool 则 C_k=A_k。
-    残差项 I 的贡献（当 alpha<1）：
-      s_I[k]    = Σ_{t∈A_last∩C_k} |g_t|
-      A_I[j,k]  = Σ_{i∈A_k ∩ C_j} |g_i|
-    最终：
-      s = α·s_attn + (1-α)·s_I
-      A = α·A_attn + (1-α)·A_I
-    """
-    assert attn_last.dim() == 4
-    B, H, T, T2 = attn_last.shape
-    assert T == T2
-    device = attn_last.device
-
-    A_mean = attn_last.mean(dim=1).to(torch.float32)  # [B,T,T]
-    if g_abs_list is None:
-        g_abs_list = [torch.ones(T, device=device, dtype=torch.float32) for _ in range(B)]
-
-    s_batch, A_batch = [], []
-
-    for b in range(B):
-        A = A_mean[b]                        # [T,T]
-        g_abs = g_abs_list[b].to(device=device, dtype=torch.float32)
-        assert g_abs.shape[0] == T
-
-        turns = turns_list[b]
-        asst_turns = turns["assistant_turns"][0]  # List[(s,e)]
-        tool_turns = turns.get("tool_turns", [[]])[0] if turns.get("tool_turns", None) else []
-        K = len(asst_turns)
-        assert K >= 1, "need at least one assistant turn"
-
-        # --- 构建每轮的 mask ---
-        mask_A = [torch.zeros(T, dtype=torch.bool, device=device) for _ in range(K)]  # rows: assistant
-        mask_C = [torch.zeros(T, dtype=torch.bool, device=device) for _ in range(K)]  # cols: assistant ∪ tool
-        for k in range(K):
-            s_k, e_k = asst_turns[k]
-            if e_k > s_k:
-                mask_A[k][s_k:e_k] = True
-                mask_C[k][s_k:e_k] = True
-            # tool 第 k 轮（存在则合并到列）
-            if k < len(tool_turns):
-                st, et = tool_turns[k]
-                if et > st:
-                    mask_C[k][st:et] = True
-
-        # --- s_attn：答案行为最后一轮的 assistant ---
-        s_attn = torch.zeros(K, device=device, dtype=torch.float32)
-        s_I    = torch.zeros(K, device=device, dtype=torch.float32) if alpha < 1.0 else None
-
-        s_last, e_last = asst_turns[-1]
-        assert e_last > s_last, "last assistant span empty?"
-        rows_last = torch.arange(s_last, e_last, device=device)
-        sum_last_cols = A.index_select(0, rows_last).sum(dim=0)   # [T] = Σ_{t∈A_last} A[t, :]
-        for k in range(K):
-            cols_k = mask_C[k]
-            if cols_k.any():
-                s_attn[k] = (sum_last_cols[cols_k] * g_abs[cols_k]).sum()
-            if alpha < 1.0:
-                # s_I[k] = Σ_{t∈A_last∩C_k} |g_t|
-                inter = mask_A[-1] & mask_C[k]
-                if inter.any():
-                    s_I[k] = g_abs[inter].sum()
-
-        # --- A_attn：对子回合 k 的 assistant 行求和；父列用 C_j ---
-        A_attn = torch.zeros(K, K, device=device, dtype=torch.float32)
-        A_I    = torch.zeros(K, K, device=device, dtype=torch.float32) if alpha < 1.0 else None
-        for k in range(K):
-            rows_k = mask_A[k]
-            if not rows_k.any():
-                continue
-            sum_child_cols = A[rows_k, :].sum(dim=0)             # [T]
-            for j in range(k):                                   # 只计 j<k
-                cols_j = mask_C[j]
-                if cols_j.any():
-                    A_attn[j, k] = (sum_child_cols[cols_j] * g_abs[cols_j]).sum()
-                if alpha < 1.0:
-                    # A_I[j,k] = Σ_{i∈A_k ∩ C_j} |g_i|
-                    inter = rows_k & cols_j
-                    if inter.any():
-                        A_I[j, k] = g_abs[inter].sum()
-
-        s_final = (alpha * s_attn) if alpha == 1.0 else (alpha * s_attn + (1.0 - alpha) * s_I)
-        A_final = (alpha * A_attn) if alpha == 1.0 else (alpha * A_attn + (1.0 - alpha) * A_I)
-
-        s_batch.append(s_final)
-        A_batch.append(A_final)
-
-    return s_batch, A_batch, A_mean
-
-def _pick_kth_layer(tuples, k):
-    # tuples: list of (layer_idx, tensor[B,H,T,Dh])
-    for layer_idx, ten in reversed(tuples):
-        if layer_idx == k:
-            return ten
-    raise RuntimeError("未在 cache 中找到最后一层的 Q/K；请确认补丁是否生效。")
-
-def attention_rollout(attentions: List[torch.Tensor], alpha: float = 0.9) -> torch.Tensor:
-    """
-    attentions: list of tensors [1, H, T, T], causal-masked & row-stochastic-ish after softmax.
-    Returns:
-      R: Tensor[T, T] = ∏_l ( alpha * mean_head(A_l) + (1-alpha)*I )
-         By decoder causality, R should be (approximately) upper-triangular (no future->past flow).
-    """
-    # Sanity: batch size must be 1
-    assert all(att.shape[0] == 1 for att in attentions), "Batch > 1 not supported here."
-
-    # Head-average for each layer: (T, T)
-    heads_mean = [att[0].mean(dim=0) for att in attentions]  # list of [T, T]
-
-    T = heads_mean[0].shape[-1]
-    I = torch.eye(T, device=heads_mean[0].device, dtype=heads_mean[0].dtype)
-
-    R = I.clone()
-    for A in heads_mean:
-        # Clamp small negatives (shouldn't happen after softmax, but numerical safety)
-        A = torch.clamp(A, min=0.0)
-        # Optional row-normalization to stabilize (comment out if undesired)
-        row_sum = A.sum(dim=-1, keepdim=True) + 1e-12
-        A = A / row_sum
-
-        A_tilde = alpha * A + (1.0 - alpha) * I
-        R = torch.matmul(R, A_tilde)  # accumulate rollout
-    return R  # [T, T]
-
-
-def plot_rollout(R: torch.Tensor, tokens: List[str], out_png: str):
-    """
-    Simple matplotlib heatmap (no seaborn).
-    Rows: source tokens (earlier), Cols: target tokens (later).
-    In decoder-only, influence should respect upper-triangular structure.
-    """
-    R_np = R.detach().cpu().float().numpy()
-
-    plt.figure(figsize=(8, 6))
-    plt.imshow(R_np, aspect="auto", origin="lower", interpolation="nearest")
-    plt.colorbar()
-    # Keep token labels light; for long sequences it's better to skip to avoid clutter.
-    max_labels = 80
-    if len(tokens) <= max_labels:
-        plt.xticks(range(len(tokens)), tokens, rotation=90, fontsize=6)
-        plt.yticks(range(len(tokens)), tokens, fontsize=6)
-    else:
-        plt.xticks([])
-        plt.yticks([])
-    plt.title("Attention Rollout R (token-to-token influence)")
-    plt.xlabel("Target token index (later)")
-    plt.ylabel("Source token index (earlier)")
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=200)
-    plt.close()
 
 
 def _find_all_subseq(hay: List[int], needle: List[int]) -> List[int]:
@@ -1228,93 +750,141 @@ def main():
     # ---------- 2) 构造输入 ----------
     prompt = tokenizer.apply_chat_template(conversations, tools=tools, tokenize=False)
 
-    # NOTE: debugging
-    # prompt = prompt[:1000]
-    #
     enc = tokenizer(prompt, return_tensors="pt")
-    inputs = {k: v.to(model.device) for k, v in enc.items()}
+    enc = {k: v.to(device) for k, v in enc.items()}
 
-    # ---------- 3) 打补丁并前向 ----------
-    turns_list = get_turns(inputs['input_ids'], inputs['attention_mask'], tokenizer)
+    # Safety: set pad token if missing
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+    if getattr(model.config, "pad_token_id", None) is None:
+        model.config.pad_token_id = tokenizer.pad_token_id
 
-    cache = QKCache(keep_all_layers=True)  # 或 target_last_layer = model.config.num_hidden_layers - 1
-    patch, restore = make_patcher(cache)
-    patch()
+    # ---------- 3) 解析回合 ----------
+    turns = get_turns(enc["input_ids"], enc["attention_mask"], tokenizer)
+    # 约定：B=1演示；多 batch 只需在最外层 for 循环
+    assert enc["input_ids"].shape[0] == 1, "示意脚本先用 batch=1，实际很容易改成批量"
+    assistant_turns = turns["assistant_turns"][0]  # List[(s,e)]
+    tool_turns = turns["tool_turns"][0]  # List[(s,e)], 若与 assistant 对不齐，下面做容错
+    assert len(assistant_turns) >= 1, "需要至少一轮 assistant 输出"
+    s_last, e_last = assistant_turns[-1]
+    assert e_last > s_last, "最后一轮答案段为空？"
+
+    # ---------- 4) 构造“输入门控”并一次反传 ----------
+    model.eval()  # 关闭dropout，保证确定性
+    model.requires_grad_(False)  # 冻结参数，反传只为 gate 计算梯度
+
+    input_ids = enc["input_ids"]  # [1, T]
+    attention_mask = enc["attention_mask"]  # [1, T]
+    B, T = input_ids.shape
+
+    # (a) 取原始 token embedding
+    embed = model.get_input_embeddings()  # nn.Embedding
     with torch.no_grad():
-        _ = model(**inputs, use_cache=False, return_dict=True, output_attentions=False)
-        # _ = model(**counterfactual_inputs, use_cache=False, return_dict=True, output_attentions=False)
-    restore()
+        e = embed(input_ids)  # [1, T, D]
+        if args.dtype in ["bf16", "fp16"] and device.type == "cuda":
+            e = e.to(torch_dtype)
 
-    # ---------- 4) 取“最后一层”的 Q/K ----------
-    L_last = model.config.num_hidden_layers-1
-
-
-    q_last = _pick_kth_layer(cache.q, L_last)[:1]  # [1,Hq,T,Dh]
-    k_last = _pick_kth_layer(cache.k, L_last)[:1]  # [1,Hkv,T,Dh]
-
-    s_ref, A_ref = accumulate_last_layer_stats_noTT_turns(
-        q_last, k_last,
-        turns=turns_list,  # 单样本
-        g_abs=None,
-        alpha=1.0
-    )
-
-    # s_ref = s_ref / s_ref.sum()
-    # A_ref = A_ref / (A_ref.sum(0).unsqueeze(0) + 1e-5)
-    
-    print('=========inputs========')
-    print(s_ref)
-
-    print(A_ref)
-    
-    
-    
-    
-    print('=======counterfactual_inputs========')
-    counterfactual_inputs = get_counterfactual_input_ids(inputs['input_ids'], inputs['attention_mask'], turns_list,tokenizer)
-
-    cache = QKCache(keep_all_layers=True)  # 或 target_last_layer = model.config.num_hidden_layers - 1
-    patch, restore = make_patcher(cache)
-    patch()
+    # (b) 选择基底向量 e_base（建议用词表均值向量，比全零更稳）
     with torch.no_grad():
-        _ = model(**counterfactual_inputs, use_cache=False, return_dict=True, output_attentions=False)
-    restore()
+        vocab_mean = embed.weight.detach().float().mean(dim=0, keepdim=True)  # [1, D]
+        e_base = vocab_mean.unsqueeze(0).expand(B, T, -1).to(e.dtype).to(device)  # [1, T, D]
 
-    # ---------- 4) 取“最后一层”的 Q/K ----------
-    L_last = model.config.num_hidden_layers - 1
+    # (c) 定义每个 token 的 gate：m∈[1]: 这里直接在 m=1 处取梯度（等价 ⟨∂L/∂ê, e-e_base⟩）
+    m = torch.ones(B, T, 1, device=device, dtype=e.dtype, requires_grad=True)
 
-    q_last = _pick_kth_layer(cache.q, L_last)[:1]  # [1,Hq,T,Dh]
-    k_last = _pick_kth_layer(cache.k, L_last)[:1]  # [1,Hkv,T,Dh]
+    def build_inputs_embeds(m_gate):
+        return m_gate * e + (1.0 - m_gate) * e_base  # [1, T, D]
 
-    s_ref_counterfactual, A_ref_counterfactual = accumulate_last_layer_stats_noTT_turns(
-        q_last, k_last,
-        turns=turns_list,  # 单样本
-        g_abs=None,
-        alpha=1.0
+    # (d) 只在最后答案段上做 CE：labels 其余位置 = -100
+    labels = torch.full_like(input_ids, fill_value=-100)
+    labels[:, s_last:e_last] = input_ids[:, s_last:e_last]
+
+    # (e) 前向 & 反向（一次）
+    inputs_embeds = build_inputs_embeds(m)
+    breakpoint()
+    outputs = model(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        labels=labels,
+        use_cache=False,
+        return_dict=True,
     )
+    loss = outputs.loss
+    # 梯度只需要 dL/dm；可选：retain_graph=False
+    loss.backward()
 
-    # s_ref_counterfactual = s_ref_counterfactual / s_ref_counterfactual.sum()
-    # A_ref_counterfactual = A_ref_counterfactual / (A_ref_counterfactual.sum(0).unsqueeze(0) + 1e-5)
-    print(s_ref_counterfactual)
+    with torch.no_grad():
+        # c_i = dL/dm_i 在 m=1 处；取绝对值作为 saliency
+        c = m.grad.abs().squeeze(-1)  # [1, T]
+        c = c * attention_mask  # 去除 padding 位置
+        c = c[0]  # [T]
 
-    print(A_ref_counterfactual)
+    # ---------- 5) 将 token 分数聚合到回合 ----------
+    def _sum_span(vec_1d, span):
+        if span is None:
+            return 0.0
+        s, e = span
+        if e <= s:
+            return 0.0
+        return float(vec_1d[s:e].sum().item())
 
-    # # ==========================================================================
-    print('=======relative_improvements========')
-    print(s_ref / (s_ref_counterfactual + 1e-5))
-    print(A_ref / (A_ref_counterfactual + 1e-5) )
-    # 以下是利用attention矩阵直接来计算
-    # s_list, A_list, Amean = credit_from_attn_matrix_turns(
-    #     attn_last,  # [B,H,T,T]
-    #     turns_list,  # len=B
-    #     g_abs_list=g_abs_list,  # len=B
-    #     alpha=1.0
-    # )
-    # #
-    # print(torch.allclose(s_list[0], s_ref, atol=1e-3, rtol=1e-3),
-    #       torch.allclose(A_list[0], A_ref, atol=1e-2, rtol=1e-2))
+    rho = getattr(args, "rho_tool_credit", 0.3)  # 工具响应的权重，0=不计入，建议[0.2,0.5]
+    temp = getattr(args, "credit_softmax_temp", 1.0)  # softmax 温度
+    length_norm = getattr(args, "credit_length_norm", "none")  # "none" | "len" | "l2"
 
+    K = len(assistant_turns)
+    s_turn = torch.zeros(K, device=device, dtype=torch.float32)
+    len_turn = torch.zeros(K, device=device, dtype=torch.float32)
+    l2_turn = torch.zeros(K, device=device, dtype=torch.float32)
 
+    for k in range(K):
+        a_span = assistant_turns[k]
+        tr_span = tool_turns[k] if k < len(tool_turns) else None
+
+        sA = _sum_span(c, a_span)
+        sTR = _sum_span(c, tr_span)
+        s = sA + rho * sTR
+
+        s_turn[k] = s
+        # 统计长度与 L2（仅 assistant 长度，用于可选归一）
+        s_k, e_k = a_span
+        len_turn[k] = max(1, e_k - s_k)
+        l2_turn[k] = float(c[s_k:e_k].pow(2).sum().sqrt().item() + 1e-12)
+
+    # 可选：做回合尺度归一，抑制“长回合独大”
+    if length_norm == "len":
+        s_turn = s_turn / (len_turn + 1e-12)
+    elif length_norm == "l2":
+        s_turn = s_turn / (l2_turn + 1e-12)
+
+    # 稳健化：减去中位数/做分位裁剪（演示只做 clip）
+    q_hi = torch.quantile(s_turn, 0.98).item() if K > 4 else s_turn.max().item()
+    s_turn = torch.clamp(s_turn, max=q_hi)
+
+    # Softmax 路由权重（停止梯度用在 RL 里）
+    w_turn = torch.softmax(s_turn / max(1e-6, temp), dim=-1)
+
+    print("=== Gate-grad token saliency (first 60) ===")
+    print(c[:60].tolist())
+    print("=== Per-turn credit s_k ===")
+    print(s_turn.tolist())
+    print("=== Routed weights w_k (softmax) ===")
+    print(w_turn.tolist())
+
+    # ---------- 6) （可选）演示如何在 RL/GRPO 中路由组优势 ----------
+    # 假设你已有 group-level advantage: A_grp
+    # 典型 adv-split： A_k = A_grp * ((1-eta)/K + eta*w_k)
+    eta = getattr(args, "adv_split_eta", 0.7)
+    A_grp = torch.tensor(getattr(args, "dummy_group_adv", 1.0), dtype=torch.float32, device=device)
+
+    A_k = A_grp * ((1.0 - eta) / K + eta * w_turn)  # stopgrad(w_turn) 在真实训练里做
+    print("=== Routed advantages A_k ===")
+    print(A_k.tolist())
+
+    # ================== 返回/集成到训练管线时你需要保存的 ==================
+    # - s_turn: 回合信用（可作为 shaping 奖励或权重）
+    # - w_turn: 归一路由权重（adv-split）
+    # - 也可以把 c（token 级）用于可视化/分析
 
 
 if __name__ == "__main__":
