@@ -2,8 +2,8 @@ tools:
   - class_name: verl.tools.rest_tool.RESTMCPTool
     config:
       rate_limit: 120
-      timeout: 30
-      max_text_length: 2000
+      timeout: 10
+      max_text_length: 20000
       type: agent-cpm-mcp
     mcp:
       mcp_servers_config_path: ./examples/sglang_multiturn/config/tool_config/agentcpm_mcp_server.json

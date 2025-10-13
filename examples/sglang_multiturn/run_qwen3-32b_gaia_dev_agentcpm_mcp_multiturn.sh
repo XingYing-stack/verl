@@ -11,29 +11,21 @@ export SWANLAB_WORKSPACE="AgentCPM_MCP"
 
 #export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-
-
-# Algorithm
-temperature=0.6
-top_p=0.95
-top_k=20 # 0 for HF rollout, -1 for vLLM rollout
-
-
 PROJECT_DIR="$(pwd)"
 CONFIG_PATH="$PROJECT_DIR/examples/sglang_multiturn/config"
-experiment_name="qwen3-8b_function_rm-gaia_dev-sgl-multi-w-tool-verify-n4-agentcpm"
+experiment_name="qwen3-32b_function_rm-gaia_dev-sgl-multi-w-tool-verify-n4-agentcpm"
 python3 -m verl.trainer.main_ppo \
     --config-path="$CONFIG_PATH" \
     --config-name='gaia_dev_multiturn_grpo' \
     algorithm.adv_estimator=grpo \
     data.train_batch_size=32 \
-    data.max_prompt_length=12000 \
-    data.max_response_length=8192 \
+    data.max_prompt_length=8192 \
+    data.max_response_length=4096 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.return_raw_chat=True \
     actor_rollout_ref.nccl_timeout=3600 \
-    actor_rollout_ref.model.path="/workspace/models/Qwen/Qwen3-8B" \
+    actor_rollout_ref.model.path="/workspace/models/Qwen/Qwen3-32B" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=False \
     actor_rollout_ref.actor.ppo_mini_batch_size=8 \
@@ -54,14 +46,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.mode=sync \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    actor_rollout_ref.rollout.temperature=${temperature} \
-    actor_rollout_ref.rollout.top_p=${top_p} \
-    actor_rollout_ref.rollout.top_k=${top_k} \
-    actor_rollout_ref.rollout.val_kwargs.temperature=${temperature} \
-    actor_rollout_ref.rollout.val_kwargs.top_p=${top_p} \
-    actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
-    actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.rollout.val_kwargs.n=1 \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","swanlab"]' \

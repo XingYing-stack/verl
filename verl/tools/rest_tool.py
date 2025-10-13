@@ -13,7 +13,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 class RESTMCPTool(BaseTool):
     """
     与 BaseTool 风格一致的 REST 兜底工具类：
-      - self.name = "<server>.<tool>"（来自 schema）
+      - self.name 使用裸工具名（MCP Manager 会在调用时补齐 server）
       - create/execute/release 生命周期与现有一致
       - execute() 通过 AgentCPMMCPClineManager.MCPManager.call_tool(...) 走 REST
     """
@@ -83,7 +83,6 @@ class RESTMCPTool(BaseTool):
             msg = "parameters is empty"
             logger.error(msg)
             return ToolResponse(text=json.dumps({"error": msg}, ensure_ascii=False)), 0.0, {}
-
         try:
             text, meta = await self._call(instance_id, parameters)
             orig_len = len(text)
@@ -94,12 +93,25 @@ class RESTMCPTool(BaseTool):
             # 判定是否失败：优先使用显式 status_code >= 400；否则 status 不在 ok_set
             status_str = str(meta.get("status", ""))
             status_code = meta.get("status_code", None)
+            if isinstance(status_code, str):
+                try:
+                    status_code = int(status_code)
+                    meta["status_code"] = status_code
+                except Exception:
+                    status_code = None
             ok_set = {"success", "ok", "succeeded", "200", "true"}
             is_error = False
             if isinstance(status_code, int):
                 is_error = status_code >= 400
             elif status_str != "":
                 is_error = status_str.lower() not in ok_set
+            if not is_error:
+                # 统一成功标签，保证下游统计能够识别 success
+                status_str = "success"
+                meta["status"] = status_str
+                if status_code is None:
+                    status_code = 200
+                    meta["status_code"] = status_code
 
             metrics = {
                 # 仅用于聚合层识别为 REST 工具，不做额外分桶输出
@@ -110,6 +122,8 @@ class RESTMCPTool(BaseTool):
                 "tool_text_len_orig": orig_len,
                 "truncation_ratio": ratio,
             }
+            if status_code is not None:
+                metrics["status_code"] = status_code
             if is_error:
                 # 填充 error 字段，方便聚合层将其计为失败并归类
                 if isinstance(status_code, int):

@@ -21,6 +21,7 @@ import multiprocessing as mp
 import os
 import time
 from copy import deepcopy
+from datetime import datetime
 from json import JSONDecodeError
 from typing import Any, Optional
 from uuid import uuid4
@@ -756,7 +757,24 @@ class SGLangRollout(BaseRollout):
             output = None
 
         # Most naive implementation, can extract tensor and send via gloo if too slow
+        barrier_start = time.perf_counter()
+        barrier_enter_ts = datetime.now().isoformat()
+        logger.info(
+            "Rank %s tp_rank %s entering dist.barrier() before async_generate broadcast at %s",
+            self._rank,
+            self._tp_rank,
+            barrier_enter_ts,
+        )
         dist.barrier()
+        barrier_wait = time.perf_counter() - barrier_start
+        barrier_exit_ts = datetime.now().isoformat()
+        logger.info(
+            "Rank %s tp_rank %s exited dist.barrier() before async_generate broadcast at %s after %.3fs",
+            self._rank,
+            self._tp_rank,
+            barrier_exit_ts,
+            barrier_wait,
+        )
         [output] = broadcast_pyobj(
             data=[output],
             rank=self._rank,
@@ -828,6 +846,14 @@ class SGLangRollout(BaseRollout):
     ) -> AsyncRolloutRequest:
         assert self._tp_rank == 0, "only the master process can call this function"
         _req = deepcopy(req)
+        request_start = time.perf_counter()
+        logger.info(
+            "Request %s rollout started at %s (rank=%s, tp_rank=%s)",
+            _req.request_id,
+            datetime.now().isoformat(),
+            self._rank,
+            self._tp_rank,
+        )
         finish_reason_type = None
         output = None
 
@@ -869,11 +895,20 @@ class SGLangRollout(BaseRollout):
 
         while current_turns < self.config.multi_turn.max_assistant_turns:
             if _req.state == AsyncRolloutRequestStateEnum.PENDING:
+                pending_start = time.perf_counter()
                 await self._handle_pending_state(_req)
+                pending_duration = time.perf_counter() - pending_start
+                logger.info(
+                    "Request %s handle_pending_state completed in %.3fs",
+                    _req.request_id,
+                    pending_duration,
+                )
                 _req.state = AsyncRolloutRequestStateEnum.RUNNING
             elif _req.state == AsyncRolloutRequestStateEnum.TOOL_CALLING:
                 if _req.messages[-1].tool_calls is not None:
                     parsed_tool_calls = _req.messages[-1].tool_calls
+                    tool_call_names = [tool_call.function.name for tool_call in parsed_tool_calls]
+                    tool_exec_start = time.perf_counter()
                     tool_call_results = await asyncio.gather(
                         *[
                             self._tool_map[tool_call.function.name].execute(
@@ -883,6 +918,13 @@ class SGLangRollout(BaseRollout):
                             )
                             for tool_call in parsed_tool_calls
                         ]
+                    )
+                    tool_exec_duration = time.perf_counter() - tool_exec_start
+                    logger.info(
+                        "Request %s executed tools %s in %.3fs",
+                        _req.request_id,
+                        tool_call_names,
+                        tool_exec_duration,
                     )
                     # Add tool responses once and get total added tokens
                     added_tokens = _req.add_tool_response_messages(
@@ -923,9 +965,19 @@ class SGLangRollout(BaseRollout):
                         "video support is not implemented yet, current length of video data is %d", len(video_data)
                     )
 
+                engine_start = time.perf_counter()
                 output = await self._handle_engine_call(_req, request_sampling_params, image_data=image_data)
+                engine_duration = time.perf_counter() - engine_start
+                finish_reason_str = output["meta_info"]["finish_reason"]["type"]
+                logger.info(
+                    "Request %s turn %d SGLang engine call finished in %.3fs (finish_reason=%s)",
+                    _req.request_id,
+                    current_turns + 1,
+                    engine_duration,
+                    finish_reason_str,
+                )
                 content = output["text"]
-                finish_reason_type = FinishReasonTypeEnum.from_str(output["meta_info"]["finish_reason"]["type"])
+                finish_reason_type = FinishReasonTypeEnum.from_str(finish_reason_str)
                 current_turns += 1
                 if finish_reason_type == FinishReasonTypeEnum.LENGTH:
                     _req.add_assistant_message(self.processing_class, content)
@@ -997,8 +1049,17 @@ class SGLangRollout(BaseRollout):
                     )
 
                 interaction = self.interaction_map[interaction_name]
+                interaction_start = time.perf_counter()
                 should_terminate_sequence, content, reward, metrics = await interaction.generate_response(
                     _req.request_id, messages, **_req.interaction_kwargs
+                )
+                interaction_duration = time.perf_counter() - interaction_start
+                logger.info(
+                    "Request %s interaction %s completed in %.3fs (terminate=%s)",
+                    _req.request_id,
+                    interaction_name,
+                    interaction_duration,
+                    should_terminate_sequence,
                 )
                 user_turn_rewards.append(reward)
                 if should_terminate_sequence:
@@ -1026,7 +1087,16 @@ class SGLangRollout(BaseRollout):
         for name in _req.tools_kwargs.keys():
             tool = self._tool_map[name]
             tool_reward_tasks.append(calc_reward_and_release_fn(name, tool))
+        reward_start = time.perf_counter()
         tool_reward_scores = await asyncio.gather(*tool_reward_tasks)
+        reward_duration = time.perf_counter() - reward_start
+        if tool_reward_tasks:
+            logger.info(
+                "Request %s tool reward calculation completed in %.3fs for tools %s",
+                _req.request_id,
+                reward_duration,
+                list(_req.tools_kwargs.keys()),
+            )
         tool_reward_scores = dict(tool_reward_scores)
         all_rewards = {**tool_reward_scores, **{"user_turn_rewards": user_turn_rewards}}
         # Log multi-turn assistant rounds
@@ -1039,6 +1109,7 @@ class SGLangRollout(BaseRollout):
         if self.config.calculate_log_probs:
             debug_sampling_params = {**self.sampling_params}
             debug_sampling_params["max_new_tokens"] = 0
+            logprob_start = time.perf_counter()
             output = await self._engine.async_generate(
                 prompt=None,
                 input_ids=_req.input_ids,
@@ -1046,8 +1117,23 @@ class SGLangRollout(BaseRollout):
                 return_logprob=True,
                 logprob_start_len=0,
             )
+            logprob_duration = time.perf_counter() - logprob_start
+            logger.info(
+                "Request %s logprob recomputation async_generate finished in %.3fs",
+                _req.request_id,
+                logprob_duration,
+            )
             # len(input_token_logprobs) = len(input_tokens)-1，because logprob of 1st token is None
             _req.output_token_ids, _req.rollout_log_probs = _extract_logprob_from_output(output)
+        total_duration = time.perf_counter() - request_start
+        logger.info(
+            "Request %s rollout finished at %s with state %s (finish_reason=%s) after %.3fs",
+            _req.request_id,
+            datetime.now().isoformat(),
+            _req.state,
+            finish_reason_type,
+            total_duration,
+        )
         return _req
 
     async def _handle_engine_call(
@@ -1179,7 +1265,24 @@ class SGLangRollout(BaseRollout):
         else:
             sorted_output_req_list = None
 
+        barrier_start = time.perf_counter()
+        barrier_enter_ts = datetime.now().isoformat()
+        logger.info(
+            "Rank %s tp_rank %s entering dist.barrier() before final request broadcast at %s",
+            self._rank,
+            self._tp_rank,
+            barrier_enter_ts,
+        )
         dist.barrier()
+        barrier_wait = time.perf_counter() - barrier_start
+        barrier_exit_ts = datetime.now().isoformat()
+        logger.info(
+            "Rank %s tp_rank %s exited dist.barrier() before final request broadcast at %s after %.3fs",
+            self._rank,
+            self._tp_rank,
+            barrier_exit_ts,
+            barrier_wait,
+        )
         [sorted_output_req_list] = broadcast_pyobj(
             data=[sorted_output_req_list],
             rank=self._rank,

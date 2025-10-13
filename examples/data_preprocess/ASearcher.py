@@ -83,11 +83,12 @@ FILES_DIR="/app/data/gaia_validation"
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_dir", default="/workspace/fanshengda/verl/input_data/gaia_dev")
-    parser.add_argument("--metadata_path", default="/workspace/fanshengda/AgentCPM-MCP/evaluation/benchmarks/gaia/gaia.jsonl")
+    parser.add_argument("--local_dir", default="/workspace/fanshengda/verl/input_data/gaia_dev/asearcher")
+    parser.add_argument("--metadata_path", default="/workspace/fanshengda/verl/input_data/aug_true_tasks.jsonl")
+
     args = parser.parse_args()
 
-    data_source = "gaia_dev"
+    data_source = "asearcher"
     
     metadata = pd.read_json(args.metadata_path, lines=True)
 
@@ -98,7 +99,7 @@ if __name__ == "__main__":
         question = example['Question']
 
         system_message = deepcopy(gaia_system_prompt_content)
-        if example['file_name']:
+        if 'file_name' in example and example['file_name']:
             user_prompt = MCP_USER_PROMPT_FOR_FILE.format(query=question, task_dir=FILES_DIR, filename=example['file_name'])
 
         else:
@@ -125,8 +126,7 @@ if __name__ == "__main__":
                 'split': 'dev',
                 'index': idx,
                 'task_id': example['task_id'],
-                'Level': example['Level'],
-                'Annotator Metadata': example['Annotator Metadata'],
+                'aug_answers': example['aug_answers'],
                 'question': question,
                 "need_tools_kwargs": True,
                 # Ensure non-empty per-tool kwargs to avoid PyArrow struct<> write error
@@ -141,13 +141,11 @@ if __name__ == "__main__":
         }
         return data
 
-
     train_dataset = pd.DataFrame([
         process_fn(row, idx) for idx, row in metadata.iterrows()
     ])
 
-
     local_dir = args.local_dir
 
-    train_dataset.to_parquet(os.path.join(local_dir, "dev_0929.parquet"))
-    print('path:', os.path.join(local_dir, "dev_0929.parquet"))
+    train_dataset.to_parquet(os.path.join(local_dir, "asearcher_1010.parquet"))
+    print('path:', os.path.join(local_dir, "asearcher_1010.parquet"))
