@@ -16,9 +16,9 @@ Metrics related to the PPO trainer.
 """
 
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
 from functools import partial
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -155,11 +155,29 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
                 buckets[str(uid)].append(float(sc))
 
             per_group_stds = []
+            debug_group_sizes: Optional[dict[str, int]] = None
+            aborted_per_uid: Optional[dict[str, int]] = None
+            should_log_group_sizes = os.getenv("VERL_DEBUG_GROUP_SIZES", "0") in {"1", "true", "True"}
+            if should_log_group_sizes or logger.isEnabledFor(logging.DEBUG):
+                debug_group_sizes = {uid: len(vals) for uid, vals in buckets.items()}
+                total_per_uid = Counter(str(uid) for uid in uids)
+                aborted_per_uid = {
+                    uid: total_per_uid.get(uid, 0) - debug_group_sizes.get(uid, 0)
+                    for uid in total_per_uid.keys()
+                }
+
             for vals in buckets.values():
                 if len(vals) <= 1:
                     per_group_stds.append(0.0)
                 else:
                     per_group_stds.append(float(np.std(vals, ddof=0)))
+
+            if debug_group_sizes is not None:
+                logger.debug(
+                    "group_std debug: non_aborted=%s aborted=%s",  # noqa: G004
+                    debug_group_sizes,
+                    aborted_per_uid,
+                )
 
             if len(per_group_stds) > 0:
                 arr = np.asarray(per_group_stds, dtype=float)

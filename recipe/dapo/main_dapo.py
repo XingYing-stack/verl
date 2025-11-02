@@ -91,13 +91,26 @@ class TaskRunner:
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
             assert config.critic.strategy in {"fsdp", "fsdp2"}
 
-            from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
+            # Select async worker when using agent loop
+            from verl.workers.fsdp_workers import (
+                ActorRolloutRefWorker as FSDPActorRolloutRefWorker,
+            )
+            from verl.workers.fsdp_workers import (
+                AsyncActorRolloutRefWorker as FSDPAsyncActorRolloutRefWorker,
+            )
+            from verl.workers.fsdp_workers import CriticWorker
 
             ray_worker_group_cls = RayWorkerGroup
 
         elif config.actor_rollout_ref.actor.strategy == "megatron":
             assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
-            from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
+            from verl.workers.megatron_workers import (
+                ActorRolloutRefWorker as MegatronActorRolloutRefWorker,
+            )
+            from verl.workers.megatron_workers import (
+                AsyncActorRolloutRefWorker as MegatronAsyncActorRolloutRefWorker,
+            )
+            from verl.workers.megatron_workers import CriticWorker
 
             ray_worker_group_cls = RayWorkerGroup
 
@@ -106,8 +119,19 @@ class TaskRunner:
 
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
+        # Choose rollout worker class based on rollout.mode
+        use_async = getattr(config.actor_rollout_ref.rollout, "mode", "sync") == "async"
+        if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
+            actor_rollout_cls = (
+                FSDPAsyncActorRolloutRefWorker if use_async else FSDPActorRolloutRefWorker
+            )
+        else:  # megatron
+            actor_rollout_cls = (
+                MegatronAsyncActorRolloutRefWorker if use_async else MegatronActorRolloutRefWorker
+            )
+
         role_worker_mapping = {
-            Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
+            Role.ActorRollout: ray.remote(actor_rollout_cls),
             Role.Critic: ray.remote(CriticWorker),
         }
 
@@ -138,24 +162,33 @@ class TaskRunner:
 
         # reference model
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
-            role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
+            # Reference policy does not need async variant
+            if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
+                role_worker_mapping[Role.RefPolicy] = ray.remote(FSDPActorRolloutRefWorker)
+            else:
+                role_worker_mapping[Role.RefPolicy] = ray.remote(MegatronActorRolloutRefWorker)
             mapping[Role.RefPolicy] = global_pool_id
+
+        # Build reward kwargs compatible with selected reward manager
+        reward_kwargs = dict(getattr(config.reward_model, "reward_kwargs", {}) or {})
+        if getattr(config.reward_model, "reward_manager", None) == "dapo":
+            # DAPORewardManager expects these kwargs; always pass and let user provide full config
+            reward_kwargs.setdefault("max_resp_len", config.data.max_response_length)
+            reward_kwargs.setdefault("overlong_buffer_cfg", config.reward_model.overlong_buffer)
 
         reward_fn = load_reward_manager(
             config,
             tokenizer,
-            0,
-            max_resp_len=config.data.max_response_length,
-            overlong_buffer_cfg=config.reward_model.overlong_buffer,
+            num_examine=0,
+            **reward_kwargs,
         )
 
         # Note that we always use function-based RM for validation
         val_reward_fn = load_reward_manager(
             config,
             tokenizer,
-            1,
-            max_resp_len=config.data.max_response_length,
-            overlong_buffer_cfg=config.reward_model.overlong_buffer,
+            num_examine=1,
+            **reward_kwargs,
         )
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 

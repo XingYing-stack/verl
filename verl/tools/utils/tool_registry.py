@@ -84,10 +84,23 @@ async def initialize_agentcpm_mcp_tool(tool_cls, tool_config) -> list:
 
     base = cfg["mcpServers"]["http-agentmcp"]["url"]
     timeout = tool_config.config.timeout
+    retries = tool_config.config.retries
+    # 读取可选的 browser_agent 配置并转为普通 dict
+    browser_agent = None
+    try:
+        if "browser_agent" in tool_config.config:
+            browser_agent = OmegaConf.to_container(tool_config.config.browser_agent, resolve=True)
+    except Exception:
+        browser_agent = None
+    logger.info(f"mcp base: {base}")
+    logger.info(f"mcp timeout: {timeout}")
+    logger.info(f"mcp retries: {retries}")
+
 
     # 1) 初始化 REST Manager，并缓存到 RESTMCPTool 的类属性，供所有实例共享
-    rest_mgr = RESTManager(manager_url=base, timeout=timeout)
+    rest_mgr = RESTManager(manager_url=base, timeout=timeout, retries=retries, browser_agent=browser_agent)
     ok = await rest_mgr.initialize()
+
     assert ok, "REST MCPManager 初始化失败"
     RESTMCPTool._rest_manager = rest_mgr
 

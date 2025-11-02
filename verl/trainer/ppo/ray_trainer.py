@@ -49,6 +49,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     compute_rollout_metrics,
     process_validation_metrics,
+    _compute_response_info
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
@@ -501,6 +502,8 @@ class RayPPOTrainer:
     def _validate(self):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+        clip_hit_total = 0
+        non_aborted_total = 0
 
         # Lists to collect samples for the table
         sample_inputs = []
@@ -568,6 +571,16 @@ class RayPPOTrainer:
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 
+            # Track response lengths for clip ratio diagnostics (mirrors training metrics logic).
+            resp_info = _compute_response_info(test_batch)
+            resp_lens = resp_info["response_length"]
+            non_aborted = resp_lens > 0
+            if bool(non_aborted.any()):
+                resp_max_len = float(test_batch.batch["responses"].shape[-1])
+                clip_hits = torch.eq(resp_lens[non_aborted], resp_max_len)
+                clip_hit_total += int(clip_hits.sum().item())
+                non_aborted_total += int(non_aborted.sum().item())
+
             # evaluate using reward_function
             if self.val_reward_fn is None:
                 raise ValueError("val_reward_fn must be provided for validation.")
@@ -603,6 +616,11 @@ class RayPPOTrainer:
                 dump_path=val_data_dir,
             )
 
+        # Drop metrics that contain unresolved values (debug instrumentation may yield None).
+        for key in list(reward_extra_infos_dict.keys()):
+            if any(val is None for val in reward_extra_infos_dict[key]):
+                reward_extra_infos_dict.pop(key)
+
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 
@@ -625,6 +643,9 @@ class RayPPOTrainer:
                         metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
+
+        if non_aborted_total > 0:
+            metric_dict["val-core/global/response_length_non_aborted/clip_ratio"] = clip_hit_total / non_aborted_total
 
         if len(sample_turns) > 0:
             sample_turns = np.concatenate(sample_turns)

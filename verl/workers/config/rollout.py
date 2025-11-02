@@ -54,6 +54,7 @@ class MultiTurnConfig(BaseConfig):
     use_inference_chat_template: bool = False
     tokenization_sanity_check_mode: str = "strict"
     format: str = "hermes"
+    context_warning_ratio: Optional[float] = -1
 
 
 @dataclass

@@ -15,6 +15,8 @@
 
 from verl.utils.import_utils import deprecated
 
+from .proposer_passk import PassAtKResult, fetch_pass_at_k, proposer_difficulty_reward
+
 
 def default_compute_score(
     data_source,
@@ -101,9 +103,12 @@ def default_compute_score(
         from . import search_r1_like_qa_em
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
-    elif data_source in ["gaia_dev", "gaia_2023_dev", "gaia"]:
+    elif data_source in ["gaia_dev", "gaia_2023_dev", "gaia", 'arpo', 'webshaper']:
         from . import gaia
         res = gaia.compute_score(solution_str, ground_truth)
+    elif data_source == "asearcher_near_miss_prm":
+        from . import pair_comparison
+        res = pair_comparison.compute_score(solution_str, ground_truth, extra_info=extra_info)
     elif data_source == "asearcher":
         from . import asearcher
 
@@ -137,4 +142,9 @@ def _default_compute_score(
     )
 
 
-__all__ = ["default_compute_score"]
+__all__ = [
+    "default_compute_score",
+    "fetch_pass_at_k",
+    "proposer_difficulty_reward",
+    "PassAtKResult",
+]

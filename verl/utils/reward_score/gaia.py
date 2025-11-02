@@ -12,16 +12,23 @@ Steps:
 
 import re
 import string
+import re
 
+def remove_think_tags(input_string):
+    # 使用正则表达式去除 <think> 和 </think> 标签之间的内容
+    result = re.sub(r'<think>.*?</think>', '', input_string, flags=re.DOTALL)
+    result = result.strip()
+    return result
 
 def extract_answer(text: str) -> str | None:
     if not text:
         return None
-    matches = re.findall(r"<answer>(.*?)</answer>", text, flags=re.DOTALL | re.IGNORECASE)
+    text = remove_think_tags(text)
+    # 核心修改在这里：在正则表达式的开头加上 .*
+    matches = re.findall(r".*<answer>(.*?)</answer>", text, flags=re.DOTALL | re.IGNORECASE)
     if not matches:
         return None
     return matches[-1].strip()
-
 
 def _normalize_number_str(number_str: str) -> float:
     for ch in ["$", "%", ","]:

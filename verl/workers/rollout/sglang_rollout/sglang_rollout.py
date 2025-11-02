@@ -319,6 +319,7 @@ class SGLangRollout(BaseRollout):
         self._init_sampling_params(**kwargs)
 
         self.processing_class = processing_class
+        self._context_warning_requests: set[str] = set()
 
         try:
             # This is when processing_class is a tokenizer
@@ -487,6 +488,21 @@ class SGLangRollout(BaseRollout):
                 # In async mode, we want token in token out.
                 "skip_tokenizer_init": self.config.mode == "async",
             }
+
+            # Map generic rollout flag to sglang engine param when requested by user.
+            # If enforce_eager is True and user did not explicitly set disable_cuda_graph in engine_kwargs,
+            # we propagate disable_cuda_graph=True to sglang to turn off CUDA graphs.
+            try:
+                if bool(self.config.get("enforce_eager", False)) and "disable_cuda_graph" not in engine_kwargs:
+                    engine_kwargs["disable_cuda_graph"] = True
+                logger.info('set disable_cuda_graph to True')
+            except Exception:
+                pass
+
+            # Merge any user-provided sglang engine kwargs (e.g., disable_cuda_graph) into args.
+            # engine_kwargs takes precedence over defaults above.
+            if engine_kwargs:
+                args.update(engine_kwargs)
 
             if is_server_mode:
                 # add server specific args
@@ -909,16 +925,22 @@ class SGLangRollout(BaseRollout):
                     parsed_tool_calls = _req.messages[-1].tool_calls
                     tool_call_names = [tool_call.function.name for tool_call in parsed_tool_calls]
                     tool_exec_start = time.perf_counter()
-                    tool_call_results = await asyncio.gather(
-                        *[
-                            self._tool_map[tool_call.function.name].execute(
+                    tool_tasks = []
+                    for tool_call in parsed_tool_calls:
+                        tool_name = tool_call.function.name
+                        tool = self._tool_map[tool_name]
+                        raw_execute_kwargs = _req.tools_kwargs.get(tool_name, {}).get("execute_kwargs", {})
+                        if raw_execute_kwargs is None:
+                            raw_execute_kwargs = {}
+                        execute_kwargs = dict(raw_execute_kwargs)
+                        tool_tasks.append(
+                            tool.execute(
                                 _req.request_id,
                                 tool_call.function.arguments,
-                                **_req.tools_kwargs.get(tool_call.function.name, {}).get("execute_kwargs", {}),
+                                **execute_kwargs,
                             )
-                            for tool_call in parsed_tool_calls
-                        ]
-                    )
+                        )
+                    tool_call_results = await asyncio.gather(*tool_tasks)
                     tool_exec_duration = time.perf_counter() - tool_exec_start
                     logger.info(
                         "Request %s executed tools %s in %.3fs",
@@ -933,6 +955,9 @@ class SGLangRollout(BaseRollout):
                     for tool_call, (resp, reward, metrics) in zip(parsed_tool_calls, tool_call_results, strict=True):
                         metrics = {**(metrics or {}), "tool_tokens": int(added_tokens)}
                         _req.update_metrics(metrics, tool_call.function.name)
+
+                    # 添加报警信息
+                    self._maybe_add_forced_answer_prompt(_req, current_turns)
                     if len(_req.input_ids) >= self.config.max_model_len:
                         finish_reason_type = FinishReasonTypeEnum.STOP
                         break
@@ -1126,6 +1151,7 @@ class SGLangRollout(BaseRollout):
             # len(input_token_logprobs) = len(input_tokens)-1，because logprob of 1st token is None
             _req.output_token_ids, _req.rollout_log_probs = _extract_logprob_from_output(output)
         total_duration = time.perf_counter() - request_start
+        self._context_warning_requests.discard(_req.request_id)
         logger.info(
             "Request %s rollout finished at %s with state %s (finish_reason=%s) after %.3fs",
             _req.request_id,
@@ -1183,6 +1209,67 @@ class SGLangRollout(BaseRollout):
 
             interaction = self.interaction_map[interaction_name]
             await interaction.start_interaction(_req.request_id, **interaction_kwargs)
+
+    def _maybe_add_forced_answer_prompt(self, _req: AsyncRolloutRequest, current_turns: int) -> None:
+        if _req.request_id in self._context_warning_requests:
+            return
+
+        max_turns = getattr(self.config.multi_turn, "max_assistant_turns", None)
+        penultimate_turn = False
+        try:
+            if max_turns is not None:
+                max_turns_val = int(max_turns)
+                if max_turns_val >= 2:
+                    penultimate_turn = current_turns == max_turns_val - 2
+        except (TypeError, ValueError):
+            penultimate_turn = False
+
+        ratio_triggered = False
+        ratio_details: tuple[int, int, float, float] | None = None
+        ratio = getattr(self.config.multi_turn, "context_warning_ratio", None)
+        if ratio is not None:
+            try:
+                ratio_val = float(ratio)
+            except (TypeError, ValueError):
+                logger.debug("Invalid context_warning_ratio %s", ratio)
+            else:
+                if 0.0 < ratio_val < 1.0 and _req.input_ids is not None:
+                    max_tokens = self.config.max_model_len
+                    if max_tokens > 0:
+                        try:
+                            current_tokens = len(_req.input_ids)
+                        except Exception:
+                            current_tokens = None
+                        if current_tokens is not None and current_tokens >= 0:
+                            usage_ratio = current_tokens / max_tokens if max_tokens else 1.0
+                            if usage_ratio >= ratio_val:
+                                ratio_triggered = True
+                                ratio_details = (current_tokens, max_tokens, usage_ratio, ratio_val)
+
+        if not penultimate_turn and not ratio_triggered:
+            return
+
+        self._context_warning_requests.add(_req.request_id)
+        warning_text = "Based on our conversation so far, please provide the final answer immediately."
+        _req.add_user_message(self.processing_class, warning_text)
+        if ratio_triggered and ratio_details is not None:
+            current_tokens, max_tokens, usage_ratio, ratio_val = ratio_details
+            logger.warning(
+                "Request %s context usage %d/%d (%.2f%%) exceeded %.0f%% threshold; forced answer prompt appended (penultimate_turn=%s).",
+                _req.request_id,
+                current_tokens,
+                max_tokens,
+                usage_ratio * 100,
+                ratio_val * 100,
+                penultimate_turn,
+            )
+        else:
+            logger.warning(
+                "Request %s forced answer prompt appended (penultimate_turn=%s, ratio_triggered=%s).",
+                _req.request_id,
+                penultimate_turn,
+                ratio_triggered,
+            )
 
     @GPUMemoryLogger(role="sglang rollout", logger=logger)
     @torch.no_grad()

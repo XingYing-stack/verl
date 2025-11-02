@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "http-agentmcp": {
-      "url": "http://127.0.0.1:8088/mcpapi"
+      "url": "http://localhost:8088/mcpapi"
     }
   }
 }

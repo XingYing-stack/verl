@@ -13,6 +13,8 @@
 # limitations under the License.
 
 from collections import defaultdict
+import logging
+import os
 
 import torch
 
@@ -21,6 +23,8 @@ from verl.utils.reward_score import default_compute_score
 from verl.workers.reward_manager import register
 from verl.workers.reward_manager.abstract import AbstractRewardManager
 
+logger = logging.getLogger(__name__)
+_LOG_REWARD_ACC = True
 
 @register("dapo")
 class DAPORewardManager(AbstractRewardManager):
@@ -37,6 +41,9 @@ class DAPORewardManager(AbstractRewardManager):
     ) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
+        logger.debug('reward_debug compute_score:', compute_score)
+        logger.debug('reward_debug reward_fn_key:', reward_fn_key)
+
         self.compute_score = compute_score or default_compute_score
         self.reward_fn_key = reward_fn_key
         self.overlong_buffer_cfg = overlong_buffer_cfg
@@ -104,12 +111,29 @@ class DAPORewardManager(AbstractRewardManager):
             score: float
             if isinstance(result, dict):
                 score = result["score"]
+                if _LOG_REWARD_ACC:
+                    logger.warning(
+                        "reward_debug data_source=%s uid=%s score=%s acc=%s diff=%s",
+                        data_source,
+                        data_item.non_tensor_batch.get("uid"),
+                        score,
+                        result.get("acc"),
+                        (score - result.get("acc", score)) if result.get("acc") is not None else 0.0,
+                    )
                 # Store the information including original reward
                 for key, value in result.items():
                     reward_extra_info[key].append(value)
             else:
                 score = result
                 reward_extra_info["acc"].append(score)
+                if _LOG_REWARD_ACC:
+                    logger.warning(
+                        "reward_debug data_source=%s uid=%s score=%s acc=%s diff=0.0",
+                        data_source,
+                        data_item.non_tensor_batch.get("uid"),
+                        score,
+                        score,
+                    )
 
             reward = score
 

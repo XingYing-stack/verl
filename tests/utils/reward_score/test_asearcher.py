@@ -2,7 +2,7 @@ from verl.utils.reward_score import default_compute_score
 
 
 def _wrap_answer(answer: str) -> str:
-    return f"<answer>{answer}</answer>"
+    return f"<answer> <answer>{answer}<answer></answer>"
 
 
 def test_asearcher_scores_augmented_answer_match():
@@ -46,3 +46,7 @@ def test_asearcher_accepts_augmented_list_input():
 
     assert score == 1.0
 
+if __name__ == "__main__":
+    test_asearcher_scores_augmented_answer_match()
+    test_asearcher_scores_incorrect_answer_zero()
+    test_asearcher_accepts_augmented_list_input()

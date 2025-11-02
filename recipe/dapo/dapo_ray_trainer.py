@@ -32,6 +32,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
+    compute_rollout_metrics,
     reduce_metrics,
 )
 from verl.trainer.ppo.ray_trainer import (
@@ -49,6 +50,54 @@ class RayDAPOTrainer(RayPPOTrainer):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
     """
+
+    def __init__(
+        self,
+        config,
+        tokenizer,
+        role_worker_mapping,
+        resource_pool_manager,
+        ray_worker_group_cls,
+        processor=None,
+        reward_fn=None,
+        val_reward_fn=None,
+        train_dataset=None,
+        val_dataset=None,
+        collate_fn=None,
+        train_sampler=None,
+        device_name=None,
+    ):
+        # Ensure dataset returns raw chat messages when using SGLang rollout
+        try:
+            from omegaconf import OmegaConf, open_dict
+
+            rollout_name = OmegaConf.select(config, "actor_rollout_ref.rollout.name")
+            if rollout_name == "sglang":
+                with open_dict(config.data):
+                    # Do not override if already explicitly set True/False by user
+                    if config.data.get("return_raw_chat", False) is False:
+                        config.data["return_raw_chat"] = True
+                        print(
+                            "[RayDAPOTrainer] Forcing data.return_raw_chat=True for SGLang rollout to provide raw_prompt."
+                        )
+        except Exception:
+            pass
+
+        super().__init__(
+            config=config,
+            tokenizer=tokenizer,
+            role_worker_mapping=role_worker_mapping,
+            resource_pool_manager=resource_pool_manager,
+            ray_worker_group_cls=ray_worker_group_cls,
+            processor=processor,
+            reward_fn=reward_fn,
+            val_reward_fn=val_reward_fn,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            collate_fn=collate_fn,
+            train_sampler=train_sampler,
+            device_name=device_name,
+        )
 
     def fit(self):
         """
@@ -111,7 +160,6 @@ class RayDAPOTrainer(RayPPOTrainer):
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
-
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
                         not prev_step_profile and curr_step_profile
@@ -121,17 +169,8 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                 new_batch: DataProto = DataProto.from_single_dict(batch_dict)
                 num_gen_batches += 1
-                # pop those keys for generation
-                if "multi_modal_data" in new_batch.non_tensor_batch.keys():
-                    gen_batch = new_batch.pop(
-                        batch_keys=["input_ids", "attention_mask", "position_ids"],
-                        non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
-                    )
-                else:
-                    gen_batch = new_batch.pop(
-                        batch_keys=["input_ids", "attention_mask", "position_ids"],
-                        non_tensor_batch_keys=["raw_prompt_ids"],
-                    )
+                # Build generation batch using the common PPO helper to keep behavior consistent.
+                gen_batch = self._get_gen_batch(new_batch)
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
                 is_last_step = self.gen_steps >= self.total_training_steps
@@ -139,7 +178,21 @@ class RayDAPOTrainer(RayPPOTrainer):
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, "red"):
-                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        # Sanity check: SGLang multi-turn requires raw_prompt from dataset
+                        if self.config.actor_rollout_ref.rollout.name == "sglang":
+                            if "raw_prompt" not in gen_batch.non_tensor_batch:
+                                cfg_flag = getattr(self.config.data, "return_raw_chat", None)
+                                keys = list(gen_batch.non_tensor_batch.keys())
+                                raise AssertionError(
+                                    f"raw_prompt missing in generation batch. non_tensor keys={keys}; "
+                                    f"config.data.return_raw_chat={cfg_flag}. "
+                                    "Set data.return_raw_chat=True in your config/CLI so dataset yields raw_prompt."
+                                )
+                        # Use AgentLoop when async mode is enabled
+                        if getattr(self, "async_rollout_mode", False):
+                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                        else:
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
@@ -147,7 +200,12 @@ class RayDAPOTrainer(RayPPOTrainer):
                         with marked_timer("gen_max", timing_raw, "red"):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
-                            gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
+                            if getattr(self, "async_rollout_mode", False):
+                                gen_baseline_output = self.async_rollout_manager.generate_sequences(
+                                    gen_baseline_batch
+                                )
+                            else:
+                                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
 
                             new_batch = new_batch.union(gen_baseline_output)
                             reward_baseline_tensor = self.reward_fn(new_batch)
@@ -328,9 +386,40 @@ class RayDAPOTrainer(RayPPOTrainer):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, "red"):
+                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+
+                        # Log rollout generations if enabled
+                        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                        if rollout_data_dir:
+                            with marked_timer("dump_rollout_generations", timing_raw, color="green"):
+                                inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+                                outputs = self.tokenizer.batch_decode(batch.batch["responses"],
+                                                                      skip_special_tokens=True)
+                                scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                                sample_gts = [
+                                    item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
+                                    for item in batch
+                                ]
+
+                                if "request_id" in batch.non_tensor_batch:
+                                    reward_extra_infos_dict.setdefault(
+                                        "request_id",
+                                        batch.non_tensor_batch["request_id"].tolist(),
+                                    )
+
+                                self._dump_generations(
+                                    inputs=inputs,
+                                    outputs=outputs,
+                                    gts=sample_gts,
+                                    scores=scores,
+                                    reward_extra_infos_dict=reward_extra_infos_dict,
+                                    dump_path=rollout_data_dir,
+                                )
+
+
 
                 # validate
                 if (
@@ -367,6 +456,28 @@ class RayDAPOTrainer(RayPPOTrainer):
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+
+
+                # training metrics
+                metrics.update(
+                    {
+                        "training/global_step": self.global_steps,
+                        "training/epoch": epoch,
+                    }
+                )
+                agg_only = False
+                try:
+                    rm_cfg = getattr(self.config.trainer, "rollout_metrics", None)
+                    if rm_cfg is not None:
+                        if isinstance(rm_cfg, dict):
+                            agg_only = bool(rm_cfg.get("aggregate_only", False))
+                        else:
+                            agg_only = bool(getattr(rm_cfg, "aggregate_only", False))
+                except Exception:
+                    pass
+                metrics.update(compute_rollout_metrics(batch=batch, aggregate_only=agg_only))
+
+
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
