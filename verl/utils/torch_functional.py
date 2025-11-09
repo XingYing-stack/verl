@@ -151,6 +151,7 @@ def entropy_from_logits(logits: torch.Tensor):
 
 def entropy_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 2048):
     """Memory-efficient entropy calculation with chunking."""
+
     entropy = torch.zeros(logits.shape[0], device=logits.device)
     for i in range(0, logits.shape[0], chunk_size):
         logits_chunk = logits[i : i + chunk_size].float()

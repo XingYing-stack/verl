@@ -32,13 +32,28 @@ def _iter_candidate_answers(ground_truth: str, extra_info: dict | None) -> Itera
         if answer:
             yield answer
 
-
+"""
+- 想启用 LLM-as-a-judge：在 extra_info 中提供
+  - question：原题面
+  - reward_model: {'style': 'llm', 'model': '<your-model-name>'}
+- 若未提供或 style='rule'，则沿用旧的规则打分。
+"""
 def compute_score(solution_str: str, ground_truth: str, *, extra_info: dict | None = None, **_) -> float:
     prediction = gaia.extract_answer(solution_str) or ""
 
+    reward_model = (extra_info or {}).get("reward_model", {})
+    style = (reward_model or {}).get("style", "rule")
+
+    if style == "rule":
+        for candidate in _iter_candidate_answers(str(ground_truth), extra_info):
+            if gaia._question_scorer(prediction, str(candidate)):
+                return 1.0
+        return 0.0
+
+    # LLM-as-a-judge path, reuse GAIA's scorer
+    question = (extra_info or {}).get("question")
+    model = (reward_model or {}).get("model")
     for candidate in _iter_candidate_answers(str(ground_truth), extra_info):
-        if gaia._question_scorer(prediction, str(candidate)):
+        if gaia._llm_scorer(prediction, str(candidate), question, model):
             return 1.0
-
     return 0.0
-

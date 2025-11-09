@@ -10,48 +10,7 @@ import datasets
 
 from copy import deepcopy
 
-MIXED_PROMPT = """# General Objective
 
-You accomplish a given task iteratively, breaking it down into clear steps and working through them methodically.
-
-## Task Strategy
-
-1. **Analyze the user's request** to clarify the task objective, break it down into clear sub-goals, and arrange them in logical order.
-2. **If the task does not require tool use, think step by step and answer the user directly.**
-3. **If the task requires tool use, develop a concise step-by-step plan** (e.g., 1., 2., 3.), with each step corresponding to a specific sub-goal, obey tool-use guidelines to solve the task.
-
-## Tool-Use Guidelines
-4. **Call only one tool per step**, prioritizing the tool that best advances the current sub-goal.
-5. **Tool Prioritization Rule: To access any online resource via a URL (like http:// or https://), including webpages and online PDFs, you must use the fetch_url tool. The read_file tool should only be used for local file URIs (e.g., file:///...).
-6. **After each tool call, stop responding immediately** and wait for user feedback or tool results. Do not assume results or continue analysis.
-7. **Extract and summarize key information from tool results** to inform the next step.
-8. **Adjust your plan promptly when new information or challenges arise**, ensuring all sub-goals are covered and nothing is missed.
-9. **For key conclusions, you must cross-validate using multiple tools or methods** to ensure the accuracy and consistency of the answer.
-10. **After you have verified the answer, output the final answer in the specified format**.
-
-## Answer Format
-- **Answers should be direct and concise**, preferably using single words, numbers with commas and unit, or brief phrases.
-- **Strictly follow the format requirements**, wrapping the final answer in `<answer>
-</answer>` tags.
-
-**Your goal: Minimize unnecessary thinking, act decisively, continuously use tools to gather information, and cross-validate with multiple tools until you can confidently provide the most concise and accurate answer.**
-
-Where:
-- `tool_call_name` must be an exact match to one of the available tools
-- `tool_call_arguments` must be valid JSON that strictly follows the tool's Parameters Schema
-- Only one tool call is allowed per responses
-"""
-
-gaia_system_prompt_content = MIXED_PROMPT.format(answer_schema="answer")
-
-
-
-MCP_USER_PROMPT_FOR_FILE = """Your task is to answer the user's question: {query}
-
-The filepath to the file you need in this task: "{task_dir}/{filename}" 
-"""
-
-MCP_USER_PROMPT = """Your task is to answer the user's question: {query}."""
 
 # gaia_tools_content = [{'type': 'function', 'function': {'name': 'mcp-code-executor.execute_code', 'description': 'Execute Python code in the conda environment. For short code snippets only. For longer code, use initialize_code_file and append_to_code_file instead.', 'parameters': {'type': 'object', 'properties': {'code': {'type': 'string', 'description': 'Python code to execute', 'enum': None}, 'filename': {'type': 'string', 'description': 'Optional: Name of the file to save the code (default: generated UUID)', 'enum': None}}, 'required': ['code']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'mcp-code-executor.initialize_code_file', 'description': 'Create a new Python file with initial content. Use this as the first step for longer code that may exceed token limits. Follow with append_to_code_file for additional code.', 'parameters': {'type': 'object', 'properties': {'content': {'type': 'string', 'description': 'Initial content to write to the file', 'enum': None}, 'filename': {'type': 'string', 'description': 'Optional: Name of the file (default: generated UUID)', 'enum': None}}, 'required': ['content']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'mcp-code-executor.append_to_code_file', 'description': 'Append content to an existing Python code file. Use this to add more code to a file created with initialize_code_file, allowing you to build up larger code bases in parts.', 'parameters': {'type': 'object', 'properties': {'file_path': {'type': 'string', 'description': 'Full path to the file', 'enum': None}, 'content': {'type': 'string', 'description': 'Content to append to the file', 'enum': None}}, 'required': ['file_path', 'content']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'mcp-code-executor.execute_code_file', 'description': 'Execute an existing Python file. Use this as the final step after building up code with initialize_code_file and append_to_code_file.', 'parameters': {'type': 'object', 'properties': {'file_path': {'type': 'string', 'description': 'Full path to the Python file to execute', 'enum': None}}, 'required': ['file_path']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'mcp-code-executor.read_code_file', 'description': 'Read the content of an existing Python code file. Use this to verify the current state of a file before appending more content or executing it.', 'parameters': {'type': 'object', 'properties': {'file_path': {'type': 'string', 'description': 'Full path to the file to read', 'enum': None}}, 'required': ['file_path']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'mcp-code-executor.install_dependencies', 'description': 'Install Python dependencies in the conda environment', 'parameters': {'type': 'object', 'properties': {'packages': {'type': 'array', 'description': 'List of packages to install', 'enum': None}}, 'required': ['packages']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'mcp-code-executor.check_installed_packages', 'description': 'Check if packages are installed in the conda environment', 'parameters': {'type': 'object', 'properties': {'packages': {'type': 'array', 'description': 'List of packages to check', 'enum': None}}, 'required': ['packages']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'mcp-code-executor.configure_environment', 'description': 'Change the environment configuration settings', 'parameters': {'type': 'object', 'properties': {'type': {'type': 'string', 'description': 'Type of Python environment', 'enum': ['conda', 'venv', 'venv-uv']}, 'conda_name': {'type': 'string', 'description': "Name of the conda environment (required if type is 'conda')", 'enum': None}, 'venv_path': {'type': 'string', 'description': "Path to the virtualenv (required if type is 'venv')", 'enum': None}, 'uv_venv_path': {'type': 'string', 'description': "Path to the UV virtualenv (required if type is 'venv-uv')", 'enum': None}}, 'required': ['type']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'mcp-code-executor.get_environment_config', 'description': 'Get the current environment configuration', 'parameters': {'type': 'object', 'properties': {}, 'required': []}, 'strict': False}}, {'type': 'function', 'function': {'name': 'mcp-server-commands.run_command', 'description': 'Run a command on this linux machine', 'parameters': {'type': 'object', 'properties': {'command': {'type': 'string', 'description': 'Command with args', 'enum': None}, 'workdir': {'type': 'string', 'description': 'Optional, current working directory', 'enum': None}, 'stdin': {'type': 'string', 'description': "Optional, text to pipe into the command's STDIN. For example, pass a python script to python3. Or, pass text for a new file to the cat command to create it!", 'enum': None}}, 'required': ['command']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'filesystem.read_file', 'description': 'Read the complete contents of a file as text. DEPRECATED: Use read_text_file instead.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': None, 'enum': None}, 'tail': {'type': 'number', 'description': 'If provided, returns only the last N lines of the file', 'enum': None}, 'head': {'type': 'number', 'description': 'If provided, returns only the first N lines of the file', 'enum': None}}, 'required': ['path']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'filesystem.read_text_file', 'description': "Read the complete contents of a file from the file system as text. Handles various text encodings and provides detailed error messages if the file cannot be read. Use this tool when you need to examine the contents of a single file. Use the 'head' parameter to read only the first N lines of a file, or the 'tail' parameter to read only the last N lines of a file. Operates on the file as text regardless of extension. Only works within allowed directories.", 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': None, 'enum': None}, 'tail': {'type': 'number', 'description': 'If provided, returns only the last N lines of the file', 'enum': None}, 'head': {'type': 'number', 'description': 'If provided, returns only the first N lines of the file', 'enum': None}}, 'required': ['path']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'filesystem.read_media_file', 'description': 'Read an image or audio file. Returns the base64 encoded data and MIME type. Only works within allowed directories.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': None, 'enum': None}}, 'required': ['path']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'filesystem.read_multiple_files', 'description': "Read the contents of multiple files simultaneously. This is more efficient than reading files one by one when you need to analyze or compare multiple files. Each file's content is returned with its path as a reference. Failed reads for individual files won't stop the entire operation. Only works within allowed directories.", 'parameters': {'type': 'object', 'properties': {'paths': {'type': 'array', 'description': None, 'enum': None}}, 'required': ['paths']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'filesystem.write_file', 'description': 'Create a new file or completely overwrite an existing file with new content. Use with caution as it will overwrite existing files without warning. Handles text content with proper encoding. Only works within allowed directories.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': None, 'enum': None}, 'content': {'type': 'string', 'description': None, 'enum': None}}, 'required': ['path', 'content']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'filesystem.edit_file', 'description': 'Make line-based edits to a text file. Each edit replaces exact line sequences with new content. Returns a git-style diff showing the changes made. Only works within allowed directories.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': None, 'enum': None}, 'edits': {'type': 'array', 'description': None, 'enum': None}, 'dryRun': {'type': 'boolean', 'description': 'Preview changes using git-style diff format', 'enum': None}}, 'required': ['path', 'edits']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'filesystem.create_directory', 'description': 'Create a new directory or ensure a directory exists. Can create multiple nested directories in one operation. If the directory already exists, this operation will succeed silently. Perfect for setting up directory structures for projects or ensuring required paths exist. Only works within allowed directories.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': None, 'enum': None}}, 'required': ['path']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'filesystem.list_directory', 'description': 'Get a detailed listing of all files and directories in a specified path. Results clearly distinguish between files and directories with [FILE] and [DIR] prefixes. This tool is essential for understanding directory structure and finding specific files within a directory. Only works within allowed directories.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': None, 'enum': None}}, 'required': ['path']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'filesystem.list_directory_with_sizes', 'description': 'Get a detailed listing of all files and directories in a specified path, including sizes. Results clearly distinguish between files and directories with [FILE] and [DIR] prefixes. This tool is useful for understanding directory structure and finding specific files within a directory. Only works within allowed directories.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': None, 'enum': None}, 'sortBy': {'type': 'string', 'description': 'Sort entries by name or size', 'enum': ['name', 'size']}}, 'required': ['path']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'filesystem.directory_tree', 'description': "Get a recursive tree view of files and directories as a JSON structure. Each entry includes 'name', 'type' (file/directory), and 'children' for directories. Files have no children array, while directories always have a children array (which may be empty). The output is formatted with 2-space indentation for readability. Only works within allowed directories.", 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': None, 'enum': None}}, 'required': ['path']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'filesystem.move_file', 'description': 'Move or rename files and directories. Can move files between directories and rename them in a single operation. If the destination exists, the operation will fail. Works across different directories and can be used for simple renaming within the same directory. Both source and destination must be within allowed directories.', 'parameters': {'type': 'object', 'properties': {'source': {'type': 'string', 'description': None, 'enum': None}, 'destination': {'type': 'string', 'description': None, 'enum': None}}, 'required': ['source', 'destination']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'filesystem.search_files', 'description': "Recursively search for files and directories matching a pattern. Searches through all subdirectories from the starting path. The search is case-insensitive and matches partial names. Returns full paths to all matching items. Great for finding files when you don't know their exact location. Only searches within allowed directories.", 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': None, 'enum': None}, 'pattern': {'type': 'string', 'description': None, 'enum': None}, 'excludePatterns': {'type': 'array', 'description': None, 'enum': None}}, 'required': ['path', 'pattern']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'filesystem.get_file_info', 'description': 'Retrieve detailed metadata about a file or directory. Returns comprehensive information including size, creation time, last modified time, permissions, and type. This tool is perfect for understanding file characteristics without reading the actual content. Only works within allowed directories.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': None, 'enum': None}}, 'required': ['path']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'filesystem.list_allowed_directories', 'description': 'Returns the list of directories that this server is allowed to access. Subdirectories within these allowed directories are also accessible. Use this to understand which directories and their nested paths are available before trying to access files.', 'parameters': {'type': 'object', 'properties': {}, 'required': []}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_create_instance', 'description': 'Create a new browser instance', 'parameters': {'type': 'object', 'properties': {'browserType': {'type': 'string', 'description': 'Browser type', 'enum': ['chromium', 'firefox', 'webkit']}, 'headless': {'type': 'boolean', 'description': 'Whether to run in headless mode', 'enum': None}, 'viewport': {'type': 'object', 'description': 'Viewport size', 'enum': None}, 'userAgent': {'type': 'string', 'description': 'User agent string', 'enum': None}, 'metadata': {'type': 'object', 'description': 'Instance metadata', 'enum': None}}, 'required': []}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_list_instances', 'description': 'List all browser instances', 'parameters': {'type': 'object', 'properties': {}, 'required': []}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_close_instance', 'description': 'Close the specified browser instance', 'parameters': {'type': 'object', 'properties': {'instanceId': {'type': 'string', 'description': 'Instance ID', 'enum': None}}, 'required': ['instanceId']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_close_all_instances', 'description': 'Close all browser instances', 'parameters': {'type': 'object', 'properties': {}, 'required': []}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_navigate', 'description': 'Navigate to a specified URL', 'parameters': {'type': 'object', 'properties': {'instanceId': {'type': 'string', 'description': 'Instance ID', 'enum': None}, 'url': {'type': 'string', 'description': 'Target URL', 'enum': None}, 'timeout': {'type': 'number', 'description': 'Timeout in milliseconds', 'enum': None}, 'waitUntil': {'type': 'string', 'description': 'Wait condition', 'enum': ['load', 'domcontentloaded', 'networkidle']}}, 'required': ['instanceId', 'url']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_go_back', 'description': 'Go back to the previous page', 'parameters': {'type': 'object', 'properties': {'instanceId': {'type': 'string', 'description': 'Instance ID', 'enum': None}}, 'required': ['instanceId']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_go_forward', 'description': 'Go forward to the next page', 'parameters': {'type': 'object', 'properties': {'instanceId': {'type': 'string', 'description': 'Instance ID', 'enum': None}}, 'required': ['instanceId']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_refresh', 'description': 'Refresh the current page', 'parameters': {'type': 'object', 'properties': {'instanceId': {'type': 'string', 'description': 'Instance ID', 'enum': None}}, 'required': ['instanceId']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_click', 'description': 'Click on a page element', 'parameters': {'type': 'object', 'properties': {'instanceId': {'type': 'string', 'description': 'Instance ID', 'enum': None}, 'selector': {'type': 'string', 'description': 'Element selector', 'enum': None}, 'button': {'type': 'string', 'description': 'Mouse button', 'enum': ['left', 'right', 'middle']}, 'clickCount': {'type': 'number', 'description': 'Number of clicks', 'enum': None}, 'delay': {'type': 'number', 'description': 'Click delay in milliseconds', 'enum': None}, 'timeout': {'type': 'number', 'description': 'Timeout in milliseconds', 'enum': None}}, 'required': ['instanceId', 'selector']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_type', 'description': 'Type text into an element', 'parameters': {'type': 'object', 'properties': {'instanceId': {'type': 'string', 'description': 'Instance ID', 'enum': None}, 'selector': {'type': 'string', 'description': 'Element selector', 'enum': None}, 'text': {'type': 'string', 'description': 'Text to input', 'enum': None}, 'delay': {'type': 'number', 'description': 'Input delay in milliseconds', 'enum': None}, 'timeout': {'type': 'number', 'description': 'Timeout in milliseconds', 'enum': None}}, 'required': ['instanceId', 'selector', 'text']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_fill', 'description': 'Fill a form field', 'parameters': {'type': 'object', 'properties': {'instanceId': {'type': 'string', 'description': 'Instance ID', 'enum': None}, 'selector': {'type': 'string', 'description': 'Element selector', 'enum': None}, 'value': {'type': 'string', 'description': 'Value to fill', 'enum': None}, 'timeout': {'type': 'number', 'description': 'Timeout in milliseconds', 'enum': None}}, 'required': ['instanceId', 'selector', 'value']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_select_option', 'description': 'Select an option from a dropdown', 'parameters': {'type': 'object', 'properties': {'instanceId': {'type': 'string', 'description': 'Instance ID', 'enum': None}, 'selector': {'type': 'string', 'description': 'Element selector', 'enum': None}, 'value': {'type': 'string', 'description': 'Value to select', 'enum': None}, 'timeout': {'type': 'number', 'description': 'Timeout in milliseconds', 'enum': None}}, 'required': ['instanceId', 'selector', 'value']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_get_page_info', 'description': 'Get detailed page information including full HTML content, page statistics, and metadata', 'parameters': {'type': 'object', 'properties': {'instanceId': {'type': 'string', 'description': 'Instance ID', 'enum': None}}, 'required': ['instanceId']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_get_element_text', 'description': 'Get element text content', 'parameters': {'type': 'object', 'properties': {'instanceId': {'type': 'string', 'description': 'Instance ID', 'enum': None}, 'selector': {'type': 'string', 'description': 'Element selector', 'enum': None}, 'timeout': {'type': 'number', 'description': 'Timeout in milliseconds', 'enum': None}}, 'required': ['instanceId', 'selector']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_get_element_attribute', 'description': 'Get element attribute value', 'parameters': {'type': 'object', 'properties': {'instanceId': {'type': 'string', 'description': 'Instance ID', 'enum': None}, 'selector': {'type': 'string', 'description': 'Element selector', 'enum': None}, 'attribute': {'type': 'string', 'description': 'Attribute name', 'enum': None}, 'timeout': {'type': 'number', 'description': 'Timeout in milliseconds', 'enum': None}}, 'required': ['instanceId', 'selector', 'attribute']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_screenshot', 'description': 'Take a screenshot of the page or element', 'parameters': {'type': 'object', 'properties': {'instanceId': {'type': 'string', 'description': 'Instance ID', 'enum': None}, 'fullPage': {'type': 'boolean', 'description': 'Whether to capture the full page', 'enum': None}, 'selector': {'type': 'string', 'description': 'Element selector (capture specific element)', 'enum': None}, 'type': {'type': 'string', 'description': 'Image format', 'enum': ['png', 'jpeg']}, 'quality': {'type': 'number', 'description': 'Image quality (1-100, JPEG only)', 'enum': None}}, 'required': ['instanceId']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_wait_for_element', 'description': 'Wait for an element to appear', 'parameters': {'type': 'object', 'properties': {'instanceId': {'type': 'string', 'description': 'Instance ID', 'enum': None}, 'selector': {'type': 'string', 'description': 'Element selector', 'enum': None}, 'timeout': {'type': 'number', 'description': 'Timeout in milliseconds', 'enum': None}}, 'required': ['instanceId', 'selector']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_wait_for_navigation', 'description': 'Wait for page navigation to complete', 'parameters': {'type': 'object', 'properties': {'instanceId': {'type': 'string', 'description': 'Instance ID', 'enum': None}, 'timeout': {'type': 'number', 'description': 'Timeout in milliseconds', 'enum': None}}, 'required': ['instanceId']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_evaluate', 'description': 'Execute JavaScript code in the page context', 'parameters': {'type': 'object', 'properties': {'instanceId': {'type': 'string', 'description': 'Instance ID', 'enum': None}, 'script': {'type': 'string', 'description': 'JavaScript code to execute', 'enum': None}}, 'required': ['instanceId', 'script']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'concurrent-browser-mcp.browser_get_markdown', 'description': 'Get page content in Markdown format, optimized for large language models', 'parameters': {'type': 'object', 'properties': {'instanceId': {'type': 'string', 'description': 'Instance ID', 'enum': None}, 'includeLinks': {'type': 'boolean', 'description': 'Whether to include links', 'enum': None}, 'maxLength': {'type': 'number', 'description': 'Maximum content length in characters', 'enum': None}, 'selector': {'type': 'string', 'description': 'Optional CSS selector to extract content from specific element only', 'enum': None}}, 'required': ['instanceId']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'search-fusion-mcp.search', 'description': 'Execute web search and return results\n            \n            Args:\n                query: Search query terms\n                num_results: Number of results to return, default 10\n                engine: Search engine type, options:\n                    - "auto": Automatically select best available search engine (default)\n                    - "google": Prioritize Google search (requires API key)\n                    - "serper": Prioritize Serper search (requires API key)\n                    - "jina": Prioritize Jina AI search\n                    - "duckduckgo": Prioritize DuckDuckGo search\n                    - "exa": Prioritize Exa search (requires API key)\n                    - "bing": Prioritize Bing search (requires API key)\n                    - "baidu": Prioritize Baidu search (requires API key)\n            ', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string', 'description': None, 'enum': None}, 'num_results': {'type': 'integer', 'description': None, 'enum': None}, 'engine': {'type': 'string', 'description': None, 'enum': None}}, 'required': ['query']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'search-fusion-mcp.fetch_url', 'description': 'Fetch web content with intelligent pagination support\n            \n            Args:\n                url: Web URL to fetch\n                use_jina: Whether to prioritize Jina Reader for LLM-optimized content, default True\n                with_image_alt: Whether to generate alt text descriptions for images, default False\n                max_length: Maximum content length per page, auto-paginate if exceeded, default 50000 characters\n                page_number: Specific page to retrieve (starting from 1), default 1\n            ', 'parameters': {'type': 'object', 'properties': {'url': {'type': 'string', 'description': None, 'enum': None}, 'use_jina': {'type': 'boolean', 'description': None, 'enum': None}, 'with_image_alt': {'type': 'boolean', 'description': None, 'enum': None}, 'max_length': {'type': 'integer', 'description': None, 'enum': None}, 'page_number': {'type': 'integer', 'description': None, 'enum': None}}, 'required': ['url']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'search-fusion-mcp.get_available_engines', 'description': 'Get list of currently available search engines and their status', 'parameters': {'type': 'object', 'properties': {}, 'required': []}, 'strict': False}}, {'type': 'function', 'function': {'name': 'search-fusion-mcp.search_wikipedia', 'description': 'Search Wikipedia page content\n            \n            Args:\n                entity: Entity to search for (people, places, concepts, events, etc.)\n                first_sentences: Number of first sentences to return (set to 0 for full content), default 10\n            ', 'parameters': {'type': 'object', 'properties': {'entity': {'type': 'string', 'description': None, 'enum': None}, 'first_sentences': {'type': 'integer', 'description': None, 'enum': None}}, 'required': ['entity']}, 'strict': False}}, {'type': 'function', 'function': {'name': 'search-fusion-mcp.search_archived_webpage', 'description': 'Search archived versions of websites using Wayback Machine\n            \n            Args:\n                url: Website URL to search\n                year: Target year (optional)\n                month: Target month (optional)\n                day: Target day (optional)\n            ', 'parameters': {'type': 'object', 'properties': {'url': {'type': 'string', 'description': None, 'enum': None}, 'year': {'type': 'integer', 'description': None, 'enum': None}, 'month': {'type': 'integer', 'description': None, 'enum': None}, 'day': {'type': 'integer', 'description': None, 'enum': None}}, 'required': ['url']}, 'strict': False}}]
 
@@ -62,17 +21,74 @@ gaia_tools_content = [{'type': 'function', 'function': {'name': 'execute_code', 
 FILES_DIR="/app/data/gaia_validation"
 
 
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--local_dir", default="/workspace/fanshengda/verl/input_data/gaia_dev")
-    parser.add_argument("--metadata_path", default="/workspace/fanshengda/AgentCPM-MCP/evaluation/benchmarks/gaia/gaia.jsonl")
+    parser.add_argument("--metadata_path", default="/workspace/fanshengda/AgentCPM-MCP/evaluation/benchmarks/gaia/dev.json")
+    parser.add_argument("--llm_judge", action="store_true")
+    parser.add_argument("--llm_judge_model", default="kimi-k2-0905-preview")
+    parser.add_argument("--prompt_type", type=str, default="agentcpm", choices=["agentcpm", "tongyi"])
+
     args = parser.parse_args()
 
+
+    if args.prompt_type == "agentcpm":
+        print('using agentcpm prompt')
+        MIXED_PROMPT = """# General Objective
+
+        You accomplish a given task iteratively, breaking it down into clear steps and working through them methodically.
+
+        ## Task Strategy
+
+        1. **Analyze the user's request** to clarify the task objective, break it down into clear sub-goals, and arrange them in logical order.
+        2. **If the task does not require tool use, think step by step and answer the user directly.**
+        3. **If the task requires tool use, develop a concise step-by-step plan** (e.g., 1., 2., 3.), with each step corresponding to a specific sub-goal, obey tool-use guidelines to solve the task.
+
+        ## Tool-Use Guidelines
+        4. **Call only one tool per step**, prioritizing the tool that best advances the current sub-goal.
+        5. **Tool Prioritization Rule: To access any online resource via a URL (like http:// or https://), including webpages and online PDFs, you must use the fetch_url tool. The read_file tool should only be used for local file URIs (e.g., file:///...).
+        6. **After each tool call, stop responding immediately** and wait for user feedback or tool results. Do not assume results or continue analysis.
+        7. **Extract and summarize key information from tool results** to inform the next step.
+        8. **Adjust your plan promptly when new information or challenges arise**, ensuring all sub-goals are covered and nothing is missed.
+        9. **For key conclusions, you must cross-validate using multiple tools or methods** to ensure the accuracy and consistency of the answer.
+        10. **After you have verified the answer, output the final answer in the specified format**.
+
+        ## Answer Format
+        - **Answers should be direct and concise**, preferably using single words, numbers with commas and unit, or brief phrases.
+        - **Strictly follow the format requirements**, wrapping the final answer in `<answer>
+        </answer>` tags.
+
+        **Your goal: Minimize unnecessary thinking, act decisively, continuously use tools to gather information, and cross-validate with multiple tools until you can confidently provide the most concise and accurate answer.**
+
+        Where:
+        - `tool_call_name` must be an exact match to one of the available tools
+        - `tool_call_arguments` must be valid JSON that strictly follows the tool's Parameters Schema
+        - Only one tool call is allowed per responses
+        """
+
+        gaia_system_prompt_content = MIXED_PROMPT.format(answer_schema="answer")
+
+        MCP_USER_PROMPT_FOR_FILE = """Your task is to answer the user's question: {query}
+
+        The filepath to the file you need in this task: "{task_dir}/{filename}" 
+        """
+
+        MCP_USER_PROMPT = """Your task is to answer the user's question: {query}."""
+    elif args.prompt_type == 'tongyi':
+        print('using tongyi prompt')
+        gaia_system_prompt_content = "You are a deep research assistant. Your core function is to conduct thorough, multi-source investigations into any topic. You must handle both broad, open-domain inquiries and queries within specialized academic fields. For every request, synthesize information from credible, diverse sources to deliver a comprehensive, accurate, and objective response. When you have gathered sufficient information and are ready to provide the definitive response, you must enclose the entire final answer within <answer></answer> tags."
+
+        MCP_USER_PROMPT_FOR_FILE = """{query} 
+        The filepath to the file you need in this task: "{task_dir}/{filename}" """
+
+        MCP_USER_PROMPT = """{query}"""
+
     data_source = "gaia_dev"
-    
-    metadata = pd.read_json(args.metadata_path, lines=True)
+
+    if args.metadata_path.endswith(".json"):
+        metadata = pd.read_json(args.metadata_path, lines=False)
+    elif args.metadata_path.endswith(".jsonl"):
+        metadata = pd.read_json(args.metadata_path, lines=True)
 
 
     # add a row to each data item that represents a unique id
@@ -81,12 +97,28 @@ if __name__ == "__main__":
         question = example['Question']
 
         system_message = deepcopy(gaia_system_prompt_content)
-        if example['file_name']:
+        if 'file_name' in example and  example['file_name']:
             user_prompt = MCP_USER_PROMPT_FOR_FILE.format(query=question, task_dir=FILES_DIR, filename=example['file_name'])
 
         else:
             user_prompt = MCP_USER_PROMPT.format(query=question)
-        solution = str(example['Final answer'])
+        solution = str(example.get("Final answer") or example.get("answer"))
+        
+        if args.llm_judge:
+            print('using llm judge')
+
+            reward_model = {
+                "style": "llm",
+                "model": args.llm_judge_model,
+                "ground_truth": solution
+            }
+        else:
+            print('using rule judge')
+
+            reward_model = {
+                "style": "rule",
+                "ground_truth": solution
+            }
 
         data = {
             "data_source": data_source,
@@ -100,17 +132,14 @@ if __name__ == "__main__":
                 "content": user_prompt,
             }],
             "ability": "fact-reasoning",
-            "reward_model": {
-                "style": "rule",
-                "ground_truth": solution
-            },
+            "reward_model": reward_model,
             "extra_info": {
                 'split': 'dev',
                 'index': idx,
                 'task_id': example['task_id'],
                 'Level': example['Level'],
-                'Annotator Metadata': example['Annotator Metadata'],
                 'question': question,
+                'reward_model': reward_model,
                 "need_tools_kwargs": True,
                 # Ensure non-empty per-tool kwargs to avoid PyArrow struct<> write error
                 # Ref: ArrowNotImplementedError: Cannot write struct type with no child field
@@ -132,5 +161,6 @@ if __name__ == "__main__":
 
     local_dir = args.local_dir
 
-    train_dataset.to_parquet(os.path.join(local_dir, "dev_docker222.parquet"))
-    print('path:', os.path.join(local_dir, "dev_docker222.parquet"))
+    output_file_name = "dev_TextOnly_LLMJudge_docker222.parquet"
+    train_dataset.to_parquet(os.path.join(local_dir, output_file_name))
+    print('path:', os.path.join(local_dir, output_file_name))

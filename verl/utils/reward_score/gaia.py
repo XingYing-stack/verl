@@ -10,9 +10,18 @@ Steps:
   * Else -> compare normalized strings (remove whitespace, lowercase, remove punctuation).
 """
 
+import os
+import time
 import re
 import string
 import re
+import logging
+from pathlib import Path
+from typing import Optional
+from openai import OpenAI
+from omegaconf import OmegaConf
+
+logger = logging.getLogger(__name__)
 
 def remove_think_tags(input_string):
     # 使用正则表达式去除 <think> 和 </think> 标签之间的内容
@@ -94,6 +103,296 @@ def _question_scorer(model_answer: str, ground_truth: str) -> bool:
         return _normalize_str(model_answer) == _normalize_str(ground_truth)
 
 
-def compute_score(solution_str: str, ground_truth: str, **_) -> float:
+def _llm_scorer(model_answer: str, ground_truth: str, question: str, model: str) -> bool:
+    if not model:
+        raise Exception("No LLM model specified")
+    # Prompt template with placeholders to inject strings
+    LLM_JUDGE_PROMPT_TEMPLATE = """
+    You are an expert evaluation assistant.
+    Your task is to judge whether the predicted answer correctly answers the question, using the labeled answer as a reference.
+
+    ---
+    Question:
+    {question}
+
+    Labeled Answer (Reference):
+    {labeled_answer}
+
+    Predicted Answer:
+    {pred_answer}
+    ---
+
+    Evaluation Criteria:
+    - **Primary focus**: Does the predicted answer correctly capture the **key information** needed to answer the question?
+    - Use the labeled answer as a reference to identify what the key information is.
+    - Focus on **factual correctness and alignment of core information** rather than completeness or surface similarity.
+    - **Key information alignment** (correct model information retrieval) is the most important factor.
+    - Minor rewordings, synonyms, or paraphrases that preserve the key information should be considered correct.
+    - **Missing non-critical/supplementary information** that can be covered is acceptable - still considered **correct**.
+    - **Additional relevant details or more specific information** beyond the labeled answer is acceptable - still considered **correct**.
+    - Only mark as **incorrect** if:
+      * The predicted answer misses **critical/key information** required to answer the question
+      * The predicted answer provides **factually incorrect information**
+      * The predicted answer is **unrelated or contradicts** the question's requirements
+
+
+    Final Decision:
+    Please respond with only one word:
+    - "Correct" → if the predicted answer correctly captures the key information with factual accuracy (even if missing minor details or including additional details).
+    - "Incorrect" → if it misses critical information, contains factually incorrect information, or is unrelated to the question.
+
+    Answer:
+    """
+
+    # LLM_JUDGE_PROMPT_TEMPLATE = """You are an evaluation assistant. Please determine if the predicted answer is equivalent to the labeled answer.
+    #
+    # Question: {question}
+    #
+    # Labeled Answer: {labeled_answer}
+    #
+    # Predicted Answer: {pred_answer}
+    #
+    # Did the model give an answer **equivalent** to the labeled answer? Please respond with "Correct" if they are equivalent, or "Incorrect" if they are not equivalent. Do not include any other text.
+    # """.strip()
+
+    # Build the concrete prompt by injecting strings
+    prompt = LLM_JUDGE_PROMPT_TEMPLATE.format(
+        question=str(question or ""),
+        labeled_answer=str(ground_truth or ""),
+        pred_answer=str(model_answer or ""),
+    )
+
+    client = OpenAI()
+
+    # Up to 5 attempts with simple backoff
+    last_text_response = ""
+    last_exception: Exception | None = None
+    max_primary_attempts = 5
+    t_primary_start = time.time()
+    for attempt in range(max_primary_attempts):
+        try:
+            messages = [{"role": "user", "content": prompt}]
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0,
+                top_p=1.0,
+                n=1,
+                frequency_penalty=0.0,
+                presence_penalty=0.0,
+                logit_bias={},
+                max_tokens=16,
+                timeout=300
+            )
+            text_response = ""
+            if getattr(response, "choices", None):
+                # Some SDKs return None; guard accordingly
+                text_response = response.choices[0].message.content or ""
+            last_text_response = text_response
+
+            # Relaxed decision: substring check for robustness in early trials
+            normalized = text_response.strip().lower()
+            if "incorrect" in normalized:
+                logger.info(
+                    "gaia_llm_scorer.primary.success",
+                    extra={
+                        "phase": "primary",
+                        "attempt": attempt + 1,
+                        "total_attempts": max_primary_attempts,
+                        "duration_ms": int((time.time() - t_primary_start) * 1000),
+                        "decision": "incorrect",
+                    },
+                )
+                return False
+            if "correct" in normalized:
+                logger.info(
+                    "gaia_llm_scorer.primary.success",
+                    extra={
+                        "phase": "primary",
+                        "attempt": attempt + 1,
+                        "total_attempts": max_primary_attempts,
+                        "duration_ms": int((time.time() - t_primary_start) * 1000),
+                        "decision": "correct",
+                    },
+                )
+                return True
+
+            # If response is unexpected, retry a couple times
+        except Exception as e:
+            logger.warning('Calling LLM judge raised an exception: %s', e)
+            # swallow and retry after a short backoff
+            last_exception = e
+        # Exponential-ish backoff: 0.2s, 0.4s, 0.8s, ...
+        time.sleep(min(0.2 * (2 ** attempt), 10))
+
+    # After 5 attempts, log an error once before applying fallback
+    try:
+        question_snippet = (str(question) or "")[:120]
+        response_snippet = (last_text_response or "")[:120]
+        logger.error(
+            "LLM scorer failed after 5 attempts (model=%s). Question=%r, last_response=%r, last_exception=%r",
+            model,
+            question_snippet,
+            response_snippet,
+            last_exception,
+        )
+    except Exception:
+        # Avoid any logging-related failure from breaking scoring
+        pass
+
+    # Secondary fallback: use browser_agent config (5 attempts)
+    def _load_browser_agent_config() -> dict:
+        """Load browser_agent config from YAML or env defaults."""
+        # Allow override via env var for path
+        default_cfg_path = "/workspace/fanshengda/verl/examples/sglang_multiturn/config/tool_config/agentcpm_mcp_tool_config.yaml"
+        cfg_path = os.environ.get(
+            "BROWSER_AGENT_CONFIG_PATH",
+            str(default_cfg_path),
+        )
+        url = "http://localhost:28888/v1"
+        key = ""
+        model_name = "qwen3-4b-instruct-2507"
+        timeout_sec: Optional[float] = 90.0
+
+        try:
+            if os.path.exists(cfg_path):
+                cfg = OmegaConf.load(cfg_path)
+                # Convert to plain Python containers to avoid DictConfig/ListConfig isinstance issues
+                cfg_py = OmegaConf.to_container(cfg, resolve=True) or {}
+                tools = cfg_py.get("tools") if isinstance(cfg_py, dict) else None
+                if isinstance(tools, list):
+                    for item in tools:
+                        conf = item.get("config", {}) if isinstance(item, dict) else {}
+                        ba = conf.get("browser_agent") if isinstance(conf, dict) else None
+                        if isinstance(ba, dict):
+                            new_url = ba.get("browser_agent_url")
+                            if new_url:
+                                url = new_url
+                            if "browser_agent_key" in ba:
+                                key = ba.get("browser_agent_key") or ""
+                            new_model = ba.get("browser_agent_model_name")
+                            if new_model:
+                                model_name = new_model
+                            if ba.get("timeout") is not None:
+                                try:
+                                    timeout_sec = float(ba.get("timeout"))
+                                except Exception:
+                                    timeout_sec = timeout_sec
+                            break
+        except Exception as e:
+            logger.warning("Failed to load browser_agent config from %s: %s", cfg_path, e)
+
+        return {
+            "browser_agent_url": url,
+            "browser_agent_key": key,
+            "browser_agent_model_name": model_name,
+            "timeout": timeout_sec,
+        }
+
+    ba_cfg = _load_browser_agent_config()
+    ba_url = ba_cfg.get("browser_agent_url")
+    ba_key = ba_cfg.get("browser_agent_key")
+    ba_model = ba_cfg.get("browser_agent_model_name")
+    ba_timeout = ba_cfg.get("timeout") or 90.0
+
+    logger.info(
+        "gaia_llm_scorer.fallback.browser_agent.start",
+        extra={
+            "phase": "fallback_browser_agent",
+            "attempts": 5,
+            "model": ba_model,
+            "url": ba_url,
+        },
+    )
+    t_ba_start = time.time()
+    try:
+        ba_client = OpenAI(api_key=ba_key or None, base_url=ba_url)
+    except Exception as e:
+        logger.error("Initialize browser_agent client failed: %s", e)
+        ba_client = None
+
+    if ba_client is not None and ba_url and ba_model:
+        attempts = 5
+        for i in range(attempts):
+            t1 = time.time()
+            try:
+                resp = ba_client.chat.completions.create(
+                    model=ba_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    top_p=1.0,
+                    n=1,
+                    max_tokens=16,
+                    timeout=float(ba_timeout),
+                )
+                content = ""
+                if getattr(resp, "choices", None):
+                    content = resp.choices[0].message.content or ""
+                norm = (content or "").strip().lower()
+                latency_ms = int((time.time() - t1) * 1000)
+                if "incorrect" in norm:
+                    logger.info(
+                        "gaia_llm_scorer.fallback.browser_agent.attempt",
+                        extra={
+                            "attempt": i + 1,
+                            "decision": "incorrect",
+                            "latency_ms": latency_ms,
+                        },
+                    )
+                    return False
+                if "correct" in norm:
+                    logger.info(
+                        "gaia_llm_scorer.fallback.browser_agent.attempt",
+                        extra={
+                            "attempt": i + 1,
+                            "decision": "correct",
+                            "latency_ms": latency_ms,
+                        },
+                    )
+                    return True
+
+                logger.info(
+                    "gaia_llm_scorer.fallback.browser_agent.attempt",
+                    extra={
+                        "attempt": i + 1,
+                        "decision": "other",
+                        "latency_ms": latency_ms,
+                    },
+                )
+            except Exception as e:
+                logger.warning("gaia_llm_scorer.browser_agent attempt %d failed: %s", i + 1, e)
+
+        logger.error(
+            "gaia_llm_scorer.fallback.browser_agent.failed",
+            extra={
+                "duration_ms": int((time.time() - t_ba_start) * 1000),
+                "attempts": attempts,
+            },
+        )
+
+    # Final fallback heuristic: relaxed substring check on last primary response
+    normalized_last = (last_text_response or "").strip().lower()
+    if "incorrect" in normalized_last:
+        return False
+    if "correct" in normalized_last:
+        return True
+    return False
+
+
+"""
+- 想启用 LLM-as-a-judge：在 extra_info 中提供
+  - question：原题面
+  - reward_model: {'style': 'llm', 'model': '<your-model-name>'}
+- 若未提供或 style='rule'，则沿用旧的规则打分。
+"""
+def compute_score(solution_str: str, ground_truth: str, **kwargs) -> float:
     pred = extract_answer(solution_str)
-    return 1.0 if _question_scorer(pred or "", str(ground_truth)) else 0.0
+
+    extra_info = kwargs.get("extra_info", {})
+    reward_model = extra_info.get('reward_model')
+    if reward_model['style'] == 'rule':
+        return 1.0 if _question_scorer(pred or "", str(ground_truth)) else 0.0
+    else:
+        question = extra_info.get('question')
+        model = reward_model.get('model')
+        return 1.0 if _llm_scorer(pred or "", str(ground_truth), question, model) else 0.0

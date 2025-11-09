@@ -287,7 +287,7 @@ if __name__ == "__main__":
     import torch
     from transformers import AutoTokenizer
     
-    json_files = ['/workspace/fanshengda/AgentCPM-MCP/sft_data/ASearcher_1020.json', '/workspace/fanshengda/AgentCPM-MCP/sft_data/ASearcher_1021.json']
+    json_files = ['/workspace/fanshengda/AgentCPM-MCP/sft_data/ASearcher_1020.json']
 
 
     # Initialize tokenizer and dataset
@@ -298,3 +298,5 @@ if __name__ == "__main__":
 
 
     print(dataset[30])
+    print(dataset[2])
+    print(dataset[1])

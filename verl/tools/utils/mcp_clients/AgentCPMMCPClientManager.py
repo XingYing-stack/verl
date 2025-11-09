@@ -73,7 +73,7 @@ class MCPManager:
         # OpenAI-compatible credentials
         self.browser_agent_key: Optional[str] = ba.get("browser_agent_key")
         self.browser_agent_model_name: Optional[str] = ba.get("browser_agent_model_name")
-
+        self.max_completion_tokens :int = ba.get("max_completion_tokens", 10000)
 
         self.enc = tiktoken.get_encoding("cl100k_base")
 
@@ -103,7 +103,7 @@ class MCPManager:
                     )
                     if attempt == retries:
                         raise
-                    await asyncio.sleep(0.2 * attempt)
+                    await asyncio.sleep(5 * attempt)
         raise last_exc  # type: ignore[misc]
 
     async def initialize(self) -> bool:
@@ -285,9 +285,17 @@ class MCPManager:
                 # 达到这里说明本次尝试失败
                 if attempt == retries:
                     break
-                await asyncio.sleep(5 * attempt)
+                await asyncio.sleep(min(3 * attempt + 0.1, 10))
 
-        # 最终失败，按异常类型返回
+        # 最终失败，记录 error，再按异常类型返回
+        if last_exc is not None:
+            logger.error(
+                "POST %s failed after %d/%d attempts: %s",
+                url,
+                retries,
+                retries,
+                last_exc,
+            )
         if isinstance(last_exc, (httpx.TimeoutException, asyncio.TimeoutError)):
             return _CallResult(status="error", text=json.dumps({"error": "timeout"}), raw=None)
         if isinstance(last_exc, httpx.HTTPStatusError):
@@ -342,7 +350,7 @@ class MCPManager:
 
     def _build_browser_messages(self, raw_content: str, tool_name: str, purpose: Optional[str]) -> list[dict]:
         # 参考 Browser Processor V5 的提示结构，并在输入前做 Token 截断
-        def _truncate(txt: str, max_tokens: int = 120000) -> str:
+        def _truncate(txt: str, max_tokens: int = 95000) -> str:
             if not isinstance(txt, str) or not txt:
                 return ""
             try:
@@ -380,6 +388,7 @@ Please process the following webpage or local file content and user goal to extr
 1. **Content Scanning for Rational**: Locate the **specific sections/data** directly related to the user's goal within the webpage content
 2. **Key Extraction for Evidence**: Identify and extract the **most relevant information** from the content, you never miss any important information, output the **full original context** of the content as far as possible, it can be more than three paragraphs.
 3. **Summary Output for Summary**: Organize into a concise paragraph with logical flow, prioritizing clarity and judge the contribution of the information to the goal.
+4. **Output Length Limit**: Please keep the output within {self.max_completion_tokens} tokens.
 
 **Final Output Format: You MUST use Markdown with the following headings:**
 ## Rational
@@ -398,34 +407,108 @@ Please process the following webpage or local file content and user goal to extr
         # 使用 OpenAI Python SDK 访问 OpenAI 兼容的 /v1 接口
         if not self.browser_agent_url or not self.browser_agent_model_name:
             return ""
-        try:
-            client = OpenAI(api_key=self.browser_agent_key, base_url=self.browser_agent_url)
-            # 将同步 SDK 调用放到线程池，外层用 wait_for 做总超时
-            def _invoke():
-                resp = client.chat.completions.create(
-                    model=self.browser_agent_model_name, messages=messages, temperature=0.0, top_p=1.0,
-                    n=1, frequency_penalty=0.0, presence_penalty=0.0, logit_bias={}
-                )
-                try:
-                    if resp and resp.choices and resp.choices[0].message.content:
-                        return resp.choices[0].message.content
-                    if resp and resp.choices and resp.choices[0].message.reasoning_content:
-                        return resp.choices[0].message.reasoning_content
-                    # OpenAI>=1.0 返回对象：choices[0].message.content
-                    return ""
-                except Exception:
-                    # 退化处理为 dict 访问
-                    try:
-                        d = resp if isinstance(resp, dict) else resp.model_dump()  # type: ignore[attr-defined]
-                        return d.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    except Exception:
-                        return ""
+        effective_timeout = float(self.browser_agent_timeout or self.timeout)
 
-            effective_timeout = float(self.browser_agent_timeout or self.timeout)
-            return await asyncio.wait_for(asyncio.to_thread(_invoke), timeout=effective_timeout)
-        except Exception as e:
-            logger.warning(f"call browser LLM failed: {e}")
-            return ""
+        last_exc: Optional[Exception] = None
+        max_attempts = 5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                client = OpenAI(api_key=self.browser_agent_key, base_url=self.browser_agent_url)
+                # 将同步 SDK 调用放到线程池，外层用 wait_for 做总超时
+                def _invoke():
+                    resp = client.chat.completions.create(
+                        model=self.browser_agent_model_name,
+                        messages=messages,
+                        temperature=0.0,
+                        top_p=1.0,
+                        n=1,
+                        frequency_penalty=0.0,
+                        presence_penalty=0.0,
+                        logit_bias={},
+                        max_completion_tokens=self.max_completion_tokens
+                    )
+                    try:
+                        if resp and resp.choices and resp.choices[0].message.content:
+                            return resp.choices[0].message.content
+                        if resp and resp.choices and getattr(resp.choices[0].message, "reasoning_content", None):
+                            return resp.choices[0].message.reasoning_content  # type: ignore[attr-defined]
+                        # OpenAI>=1.0 返回对象：choices[0].message.content
+                        return ""
+                    except Exception:
+                        # 退化处理为 dict 访问
+                        try:
+                            d = resp if isinstance(resp, dict) else resp.model_dump()  # type: ignore[attr-defined]
+                            return d.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        except Exception:
+                            return ""
+
+                result: str = await asyncio.wait_for(asyncio.to_thread(_invoke), timeout=effective_timeout)
+                if isinstance(result, str) and result.strip():
+                    return result
+                else:
+                    logger.warning(
+                        "call browser LLM empty response on attempt %d/%d",
+                        attempt,
+                        max_attempts,
+                    )
+            except Exception as e:
+                last_exc = e
+                logger.warning(
+                    "call browser LLM failed on attempt %d/%d: %s",
+                    attempt,
+                    max_attempts,
+                    e,
+                )
+
+            # 渐进退避，避免瞬时抖动；最后一次不再等待
+            if attempt < max_attempts:
+                # 在所有重试场景进行 70% 截断并重试
+                try:
+                    # 仅处理形如 {"role": ..., "content": str} 的消息
+                    idx_and_lens: list[tuple[int, int]] = []
+                    for i, m in enumerate(messages):
+                        c = m.get("content") if isinstance(m, dict) else None  # type: ignore[assignment]
+                        if isinstance(c, str) and c:
+                            # 以 token 粒度截断，尽可能稳定
+                            try:
+                                toks = self.enc.encode(c)
+                                idx_and_lens.append((i, len(toks)))
+                            except Exception:
+                                idx_and_lens.append((i, len(c)))
+
+                    if idx_and_lens:
+                        # 选出当前最长的消息进行收缩
+                        idx_and_lens.sort(key=lambda x: x[1], reverse=True)
+                        target_idx = idx_and_lens[0][0]
+                        content_val = messages[target_idx].get("content")  # type: ignore[index]
+                        if isinstance(content_val, str) and content_val:
+                            try:
+                                toks = self.enc.encode(content_val)
+                                new_len = max(1, int(len(toks) * 0.7))
+                                if new_len < len(toks):
+                                    messages[target_idx]["content"] = self.enc.decode(toks[:new_len])  # type: ignore[index]
+                            except Exception:
+                                # 回退为按字符长度截断
+                                new_len = max(1, int(len(content_val) * 0.7))
+                                if new_len < len(content_val):
+                                    messages[target_idx]["content"] = content_val[:new_len]  # type: ignore[index]
+
+                        logger.warning(
+                            "call browser LLM will retry with truncated input (attempt %d/%d)",
+                            attempt + 1,
+                            max_attempts,
+                        )
+                except Exception as _truncate_exc:
+                    logger.debug("truncate on retry ignored due to error: %s", _truncate_exc)
+
+                await asyncio.sleep(min(2 * attempt, 10))
+
+        # 所有重试失败
+        if last_exc is not None:
+            logger.error("call browser LLM failed after %d attempts: %s", max_attempts, last_exc)
+        else:
+            logger.error("call browser LLM failed after %d attempts: empty response", max_attempts)
+        return ""
 
     async def _maybe_process_with_browser_agent(self, tool_name: str, parameters: Dict[str, Any], data: Any) -> Optional[str]:
         # 仅解析 purpose，用于目标导向摘要

@@ -10,7 +10,7 @@ export SWANLAB_WORKSPACE="AgentCPM_MCP"
 export VERL_LOGGING_LEVEL=DEBUG
 
 nproc_per_node=8
-experiment_name=Qwen3-4B-2507-ALL_ASearcher_DeepDive_1102_bs32_epoch3
+experiment_name=Qwen3-4B-2507-all_asearcher_MiroVerse_tydpr_deepdive-1106
 save_path=/workspace/fanshengda/verl/mcp_agent_ckpts/${experiment_name}
 train_json=$(python - <<'PY'
 import json
@@ -26,7 +26,22 @@ paths = [
     "/workspace/fanshengda/AgentCPM-MCP/sft_data/ASearcher_1021.json",
     "/workspace/fanshengda/AgentCPM-MCP/sft_data/ASearcher_1022.json",
     "/workspace/fanshengda/AgentCPM-MCP/sft_data/deepdive_1031.json",
-    "/workspace/fanshengda/AgentCPM-MCP/sft_data/ASearcher_force_answer_1031.json"
+    "/workspace/fanshengda/AgentCPM-MCP/sft_data/ASearcher_force_answer_1031.json",
+    "/workspace/fanshengda/AgentCPM-MCP/sft_data/deepdive_qa_rl_all_valid_messages.json",
+    "/workspace/fanshengda/AgentCPM-MCP/sft_data/deepdive_qa_sft_all_valid_messages.json",
+    "/workspace/fanshengda/AgentCPM-MCP/sft_data/mirovoyage_filted_top4000_all_valid_messages.json",
+    '/workspace/fanshengda/AgentCPM-MCP/sft_data/MiroVerse-WikiTables.json',
+    '/workspace/fanshengda/AgentCPM-MCP/sft_data/MiroVerse-TaskCraft.json',
+    '/workspace/fanshengda/AgentCPM-MCP/sft_data/MiroVerse-HotpotQA.json',
+    '/workspace/fanshengda/AgentCPM-MCP/sft_data/MiroVerse-MegaScience.json',
+    '/workspace/fanshengda/AgentCPM-MCP/sft_data/MiroVerse-WebDancer.json',
+    '/workspace/fanshengda/AgentCPM-MCP/sft_data/MiroVerse-MuSiQue.json',
+    '/workspace/fanshengda/AgentCPM-MCP/sft_data/MiroVerse-WebWalkerQA-Silver.json',
+    '/workspace/fanshengda/AgentCPM-MCP/sft_data/MiroVerse-Voyager1.0.json',
+    '/workspace/fanshengda/AgentCPM-MCP/sft_data/MiroVerse-OneGen-TrainDataset-MultiHopQA.json',
+    '/workspace/fanshengda/AgentCPM-MCP/sft_data/MiroVerse-WebShaper.json',
+    '/workspace/fanshengda/AgentCPM-MCP/sft_data/MiroVerse-2WikiMultihopQA.json',
+    '/workspace/fanshengda/AgentCPM-MCP/sft_data/MiroVerse-QA-Expert-Multi-Hop-V1.0.json'
 ]
 
 print(json.dumps(paths))
@@ -40,10 +55,8 @@ torchrun --nnodes=1 --nproc_per_node=$nproc_per_node \
     data.train_files="$train_json" \
     data.val_files="[/workspace/fanshengda/AgentCPM-MCP/sft_data/ASearcher_1004.json]" \
     data.multiturn.enable=true \
-    data.max_length=64000 \
+    data.max_length=65536 \
     data.train_batch_size=32 \
-    optim.lr_scheduler=wsd \
-    optim.warmup_steps_ratio=0.1 \
     optim.lr=2e-5 \
     data.truncation=error \
     +data.enable_thinking=true \
@@ -62,6 +75,6 @@ torchrun --nnodes=1 --nproc_per_node=$nproc_per_node \
     trainer.logger='["console","swanlab"]' \
     use_remove_padding=true \
     trainer.test_freq=-1 \
-    trainer.save_freq=475 \
+    trainer.save_freq=500 \
     +trainer.val_before_train=False \
     ulysses_sequence_parallel_size=4

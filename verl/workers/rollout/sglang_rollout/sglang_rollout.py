@@ -1227,24 +1227,40 @@ class SGLangRollout(BaseRollout):
         ratio_triggered = False
         ratio_details: tuple[int, int, float, float] | None = None
         ratio = getattr(self.config.multi_turn, "context_warning_ratio", None)
-        if ratio is not None:
+        max_tokens = self.config.max_model_len or 0
+        if ratio is not None and _req.input_ids is not None and max_tokens > 0:
             try:
                 ratio_val = float(ratio)
             except (TypeError, ValueError):
                 logger.debug("Invalid context_warning_ratio %s", ratio)
             else:
-                if 0.0 < ratio_val < 1.0 and _req.input_ids is not None:
-                    max_tokens = self.config.max_model_len
-                    if max_tokens > 0:
-                        try:
-                            current_tokens = len(_req.input_ids)
-                        except Exception:
-                            current_tokens = None
-                        if current_tokens is not None and current_tokens >= 0:
-                            usage_ratio = current_tokens / max_tokens if max_tokens else 1.0
-                            if usage_ratio >= ratio_val:
-                                ratio_triggered = True
-                                ratio_details = (current_tokens, max_tokens, usage_ratio, ratio_val)
+                if 0.0 < ratio_val < 1.0:
+                    try:
+                        current_tokens = int(_req.input_ids.shape[-1])
+                    except Exception:
+                        logger.debug("Failed to compute token usage for request %s", _req.request_id)
+                    else:
+                        usage_ratio = current_tokens / max_tokens
+                        ratio_details = (current_tokens, max_tokens, usage_ratio, ratio_val)
+                        if usage_ratio >= ratio_val:
+                            ratio_triggered = True
+
+        if ratio_details is None:
+            current_tokens = int(_req.input_ids.shape[-1]) if _req.input_ids is not None else -1
+            usage_ratio = current_tokens / max_tokens if max_tokens else 0.0
+            ratio_val = float(ratio) if isinstance(ratio, (float, int)) else -1.0
+            ratio_details = (current_tokens, max_tokens, usage_ratio, ratio_val)
+
+        current_tokens, max_tokens, usage_ratio, ratio_val = ratio_details
+        logger.debug(
+            "Forced answer debug information: request=%s usage=%d/%d (%.2f%%) threshold=%.0f%% penultimate_turn=%s",
+            _req.request_id,
+            current_tokens,
+            max_tokens,
+            usage_ratio * 100,
+            ratio_val * 100,
+            penultimate_turn,
+        )
 
         if not penultimate_turn and not ratio_triggered:
             return

@@ -63,6 +63,7 @@ def process_single_row(row, current_split_name, row_index):
     # Extract ground truth from reward_model or fallback to golden_answers
     reward_model_data = row.get("reward_model")
     if isinstance(reward_model_data, dict) and "ground_truth" in reward_model_data:
+        reward_model_data['ground_truth']['target'] = list(reward_model_data['ground_truth']['target'])
         ground_truth = reward_model_data.get("ground_truth")
     else:
         ground_truth = row.get("golden_answers", [])
@@ -164,7 +165,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--local_dir",
-        default="~/data/searchR1_processed_direct",
+        default="/workspace/fanshengda/verl/input_data/searchR1_processed_direct",
         help="Local directory to save the processed Parquet files.",
     )
     parser.add_argument("--hdfs_dir", default=None, help="Optional HDFS directory to copy the Parquet files to.")

@@ -105,14 +105,13 @@ def default_compute_score(
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
     elif data_source in ["gaia_dev", "gaia_2023_dev", "gaia", 'arpo', 'webshaper']:
         from . import gaia
-        res = gaia.compute_score(solution_str, ground_truth)
-    elif data_source == "asearcher_near_miss_prm":
-        from . import pair_comparison
-        res = pair_comparison.compute_score(solution_str, ground_truth, extra_info=extra_info)
+        res = gaia.compute_score(solution_str, ground_truth, extra_info=extra_info)
     elif data_source == "asearcher":
         from . import asearcher
-
         res = asearcher.compute_score(solution_str, ground_truth, extra_info=extra_info)
+    elif data_source in ["searchR1_near_miss_prm", "asearcher_near_miss_prm"] :
+        from . import pair_comparison
+        res = pair_comparison.compute_score(solution_str, ground_truth, extra_info=extra_info)
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 

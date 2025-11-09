@@ -2,8 +2,8 @@ tools:
   - class_name: verl.tools.rest_tool.RESTMCPTool
     config:
       rate_limit: 120
-      timeout: 90
-      retries: 5
+      timeout: 130
+      retries: 3
       max_text_length: 20000
       type: agent-cpm-mcp
       browser_agent:
@@ -13,6 +13,7 @@ tools:
         browser_agent_key: ""
         browser_agent_model_name: "qwen3-4b-instruct-2507"
         # Optional override for browser agent request total timeout (seconds)
-        timeout: 300
+        timeout: 90
+        max_completion_tokens: 8000
     mcp:
       mcp_servers_config_path: ./examples/sglang_multiturn/config/tool_config/agentcpm_mcp_server.json

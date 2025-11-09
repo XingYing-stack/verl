@@ -628,6 +628,7 @@ Optim
 
   - ``cosine``: Cosine learning rate scheduler with warmup (default).
   - ``wsd``: Warmup-Stable-Decay scheduler that provides a stable learning rate phase between warmup and decay phases.
+  - ``constant``: Constant learning rate with optional linear warmup (set ``optim.warmup_steps_ratio`` to 0.0 for fully constant LR).
 
 Model
 ~~~~~~~~~~~~

@@ -1,4 +1,4 @@
-# nohup sh ./examples/sglang_multiturn/run_sync_DAPO_qwen3-4b_gaia_dev_agentcpm_mcp_multiturn.sh > ./logs/run_sync_DAPO_$(date +"%Y%m%d_%H%M%S").log 2>&1 &
+# nohup sh ./examples/sglang_multiturn/run_LLM_sync_DAPO_qwen3-4b_gaia_dev_agentcpm_mcp_multiturn.sh > ./logs/run_sync_DAPO_$(date +"%Y%m%d_%H%M%S").log 2>&1 &
 set -x
 export LOGLEVEL=DEBUG
 ulimit -n 65535
@@ -7,18 +7,21 @@ export VERL_ASSERT_ROLLOUT_METRICS=1
 export SWANLAB_API_KEY="WoZrF9qolYJjzYBCfArih"
 export SWANLAB_WORKSPACE="AgentCPM_MCP"
 export VERL_LOGGING_LEVEL=DEBUG
+export OPENAI_API_KEY="sk-6y8kz2o3U0hG77KSQEto0s0GFWGprChx2tzO8DmL1TSfJlQ1"
+export OPENAI_BASE_URL="https://api.moonshot.cn/v1"
+
+#export OPENAI_API_KEY="sk-abHpUvVt7LLnmEyxCe17021d8e774e97Bd7aA9Bc4f2b1076"
+#export OPENAI_BASE_URL="https://toollearning.cn/v1"
+
 
 # Algorithm
 temperature=0.6
 top_p=0.95
 top_k=20 # 0 for HF rollout, -1 for vLLM rollout
-model_path="/workspace/fanshengda/verl/mcp_agent_ckpts/Qwen3-4B-2507-ALL_ASearcher_DeepDive_1102_bs32/hf_global_step_475"
+model_path="/workspace/fanshengda/verl/mcp_agent_ckpts/Qwen3-4B-2507-ALL_ASearcher_DeepDive_1102_bs32_epoch3/hf_global_step_1425"
 #model_path="/workspace/models/Qwen/Qwen3-4B-Thinking-2507-keep-empty-think"
 PROJECT_DIR="$(pwd)"
 loss_agg_mode="token-mean"
-
-
-
 rollout_num=8
 max_turns=30
 context_warning_ratio=0.8
@@ -27,14 +30,12 @@ MAX_PROMPT_LENGTH=4000
 MAX_RESPONSE_LENGTH=60000
 
 CONFIG_PATH="$PROJECT_DIR/examples/sglang_multiturn/config"
-experiment_name="qwen3-4b-sync-DAPO_1102SFT_ckpt475-n${rollout_num}-webshaper-turn${max_turns}-warning_ratio${context_warning_ratio}-ppo_epochs${ppo_epochs}"
+experiment_name="qwen3-4b-sync-DAPO_1102SFT_ckpt1425-n${rollout_num}-webshaper-turn${max_turns}-warning_ratio${context_warning_ratio}-ppo_epochs${ppo_epochs}"
 python3 -m recipe.dapo.main_dapo \
     --config-path="$CONFIG_PATH" \
     --config-name='gaia_dev_multiturn_grpo' \
     algorithm.adv_estimator=grpo \
     data.train_batch_size=8 \
-    +data.gen_batch_size=4 \
-    +data.val_batch_size=32 \
     data.max_prompt_length=${MAX_PROMPT_LENGTH} \
     data.max_response_length=${MAX_RESPONSE_LENGTH} \
     +data_max_model_len=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) \
@@ -72,7 +73,7 @@ python3 -m recipe.dapo.main_dapo \
     actor_rollout_ref.ref.entropy_from_logits_with_chunking=True \
     actor_rollout_ref.ref.entropy_checkpointing=True \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
-    actor_rollout_ref.rollout.max_num_seqs=32 \
+    actor_rollout_ref.rollout.max_num_seqs=1024 \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) \
     actor_rollout_ref.rollout.n=${rollout_num} \
     actor_rollout_ref.rollout.over_sample_rate=0 \
@@ -101,11 +102,11 @@ python3 -m recipe.dapo.main_dapo \
     trainer.rollout_data_dir="/workspace/fanshengda/verl/rollout_data/$experiment_name-train" \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.save_freq=10 \
     trainer.test_freq=10 \
     +trainer.rollout_metrics.aggregate_only=False \
-    data.train_files=/workspace/fanshengda/verl/input_data/webshaper/webshaper_docker222.parquet \
-    data.val_files=/workspace/fanshengda/verl/input_data/gaia_dev/dev_docker222.parquet \
+    data.train_files=/workspace/fanshengda/verl/input_data/webshaper/webshaper_LLMJudge_docker222.parquet \
+    data.val_files=/workspace/fanshengda/verl/input_data/gaia_dev/dev_TextOnly_LLMJudge_docker222.parquet \
     actor_rollout_ref.rollout.multi_turn.tool_config_path="$PROJECT_DIR/examples/sglang_multiturn/config/tool_config/agentcpm_mcp_tool_config.yaml" \
     trainer.total_epochs=15 $@

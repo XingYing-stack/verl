@@ -142,7 +142,12 @@ class Tracking:
         if "wandb" in self.logger:
             self.logger["wandb"].finish(exit_code=0)
         if "swanlab" in self.logger:
-            self.logger["swanlab"].finish()
+            try:
+                self.logger["swanlab"].finish()
+            except RuntimeError as exc:
+                # SwanLab raises when finish() is called without a successful init; ignore silently.
+                if "swanlab.init" not in str(exc):
+                    raise
         if "vemlp_wandb" in self.logger:
             self.logger["vemlp_wandb"].finish(exit_code=0)
         if "tensorboard" in self.logger:

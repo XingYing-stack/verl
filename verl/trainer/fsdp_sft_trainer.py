@@ -65,7 +65,11 @@ from verl.utils.logger import log_with_rank
 from verl.utils.profiler import log_gpu_memory_usage
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.torch_dtypes import PrecisionType
-from verl.utils.torch_functional import get_cosine_schedule_with_warmup, get_wsd_schedule_with_warmup
+from verl.utils.torch_functional import (
+    get_cosine_schedule_with_warmup,
+    get_wsd_schedule_with_warmup,
+    get_constant_schedule_with_warmup,
+)
 from verl.utils.tracking import Tracking
 from verl.utils.ulysses import (
     gather_outputs_and_unpad,
@@ -348,6 +352,11 @@ class FSDPSFTTrainer:
         elif self.config.optim.lr_scheduler == "wsd":
             self.lr_scheduler = get_wsd_schedule_with_warmup(
                 optimizer=self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps
+            )
+        elif self.config.optim.lr_scheduler == "constant":
+            # Keep LR constant after optional warmup
+            self.lr_scheduler = get_constant_schedule_with_warmup(
+                optimizer=self.optimizer, num_warmup_steps=num_warmup_steps
             )
         else:
             raise ValueError(f"Unknown lr scheduler: {self.config.optim.lr_scheduler}")
