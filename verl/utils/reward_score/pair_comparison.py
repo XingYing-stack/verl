@@ -170,10 +170,10 @@ def _score_final(parsed: dict[str, Any], ground_truth: Any) -> float:
     truth = _load_ground_truth(ground_truth)
 
     reward = 0.0
-    if pred_t1 == truth["trajectory_1"]:
-        reward += 0.5
-    if pred_t2 == truth["trajectory_2"]:
-        reward += 0.5
+    if pred_t1 == truth["trajectory_1"] and pred_t2 == truth["trajectory_2"]:
+        reward += 1.0
+    # if pred_t2 == truth["trajectory_2"]:
+    #     reward += 0.5
     return reward
 
 

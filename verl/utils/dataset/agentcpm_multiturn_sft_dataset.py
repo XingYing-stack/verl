@@ -62,6 +62,9 @@ class AgentCPMMultiTurnSFTDataset(MultiTurnSFTDataset):
         if unused_kwargs:
             logging.warning("Unused keyword arguments received: %s", sorted(unused_kwargs))
 
+
+        # 缓冲length，避免因为多轮构造导致爆长度
+        self.buffer_len = 128
         # Set defaults and extract parameters from config if provided
         config = config or {}
         self.truncation = config.get("truncation", "error")
@@ -262,7 +265,7 @@ class AgentCPMMultiTurnSFTDataset(MultiTurnSFTDataset):
             lengths = encoded["length"]
 
             for offset, length in enumerate(lengths):
-                if length <= self.max_prompt_length:
+                if length <= self.max_prompt_length - self.buffer_len:
                     kept_indices.append(start + offset)
                 else:
                     removed += 1

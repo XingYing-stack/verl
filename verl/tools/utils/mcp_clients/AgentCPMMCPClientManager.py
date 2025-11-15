@@ -46,10 +46,12 @@ class MCPManager:
         timeout: int = 60,
         retries: int = 5,
         browser_agent: Optional[dict] = None,
+        rate_limit: Optional[int] = None,
     ):
         self.base = manager_url.rstrip("/")
         self.timeout = timeout
         self.retries = retries
+        self.rate_limit = rate_limit if rate_limit and rate_limit > 0 else None
         # 不在此处持久化 AsyncClient，避免跨事件循环复用导致绑定错误。
         # 在每次请求中临时创建 AsyncClient（async with httpx.AsyncClient(...)).
         # 这样可以彻底避免 “Event bound to a different event loop” 问题。
@@ -61,6 +63,8 @@ class MCPManager:
         self.tool_client_mapping: Dict[str, Optional[str]] = {}
         # 保留带 server 前缀的原始名字，便于兼容旧调用方式
         self.full_tool_name_mapping: Dict[str, Optional[str]] = {}
+        self.tool_semaphores: Dict[str, asyncio.Semaphore] = {}
+        self._semaphore_creation_lock: Optional[asyncio.Lock] = None
         # 浏览器处理器配置
         ba = browser_agent or {}
         self.browser_agent_enabled: bool = bool(ba.get("enable", False))
@@ -227,86 +231,109 @@ class MCPManager:
 
         server_name, tool_name = resolved_name.split('.')
         url = f"{self.base}/tool/{resolved_name}"
-        last_exc: Optional[Exception] = None
-        # 每次调用临时创建 AsyncClient，避免跨 loop 复用
-        async with httpx.AsyncClient(timeout=None) as client:
-            for attempt in range(1, retries + 1):
-                try:
-                    # 使用 asyncio.wait_for 包裹以实现“总超时”，避免仅依赖 httpx 的分阶段超时配置
-                    overall_timeout = float(timeout or self.timeout)
-                    r = await asyncio.wait_for(
-                        client.post(url, json=parameters),
-                        timeout=overall_timeout,
-                    )
-                    r.raise_for_status()
-                    data = r.json()
-                    status = data.get("status", "success")
-                    # 默认将原始 JSON 序列化作为文本返回
-                    text = json.dumps(data, ensure_ascii=False)
 
-                    # ====================如启用浏览器处理器，并且命中工具名单，则尝试调用外部 LLM 生成摘要==========================
-                    if self.browser_agent_enabled and self._should_process_with_browser_agent(tool_name):
-                        try:
-                            processed_text = await self._maybe_process_with_browser_agent(tool_name, parameters, data)
-                            if isinstance(processed_text, str) and processed_text.strip():
-                                text = processed_text
-                        except Exception as proc_exc:
-                            logger.warning(f"Browser agent processing failed: {proc_exc}")
-                    # ==============================================================================
-                    return _CallResult(status=status, text=text, raw=data)
+        async def _execute_request() -> _CallResult:
+            last_exc: Optional[Exception] = None
+            # 每次调用临时创建 AsyncClient，避免跨 loop 复用
+            async with httpx.AsyncClient(timeout=None) as client:
+                for attempt in range(1, retries + 1):
+                    try:
+                        # 使用 asyncio.wait_for 包裹以实现“总超时”，避免仅依赖 httpx 的分阶段超时配置
+                        overall_timeout = float(timeout or self.timeout)
+                        r = await asyncio.wait_for(
+                            client.post(url, json=parameters),
+                            timeout=overall_timeout,
+                        )
+                        r.raise_for_status()
+                        data = r.json()
+                        status = data.get("status", "success")
+                        # 默认将原始 JSON 序列化作为文本返回
+                        text = json.dumps(data, ensure_ascii=False)
 
-                except (httpx.TimeoutException, asyncio.TimeoutError) as e:
-                    last_exc = e
-                    logger.warning(
-                        "POST %s attempt %d/%d timeout: %s",
-                        url,
-                        attempt,
-                        retries,
-                        e,
-                    )
-                except httpx.HTTPStatusError as e:
-                    last_exc = e
-                    logger.warning(
-                        "POST %s attempt %d/%d HTTP error: %s",
-                        url,
-                        attempt,
-                        retries,
-                        e,
-                    )
-                except Exception as e:
-                    last_exc = e
-                    logger.warning(
-                        "POST %s attempt %d/%d failed: %s",
-                        url,
-                        attempt,
-                        retries,
-                        e,
-                    )
-                # 达到这里说明本次尝试失败
-                if attempt == retries:
-                    break
-                await asyncio.sleep(min(3 * attempt + 0.1, 10))
+                        # ====================如启用浏览器处理器，并且命中工具名单，则尝试调用外部 LLM 生成摘要==========================
+                        if self.browser_agent_enabled and self._should_process_with_browser_agent(tool_name):
+                            try:
+                                processed_text = await self._maybe_process_with_browser_agent(tool_name, parameters, data)
+                                if isinstance(processed_text, str) and processed_text.strip():
+                                    text = processed_text
+                            except Exception as proc_exc:
+                                logger.warning(f"Browser agent processing failed: {proc_exc}")
+                        # ==============================================================================
+                        return _CallResult(status=status, text=text, raw=data)
 
-        # 最终失败，记录 error，再按异常类型返回
-        if last_exc is not None:
-            logger.error(
-                "POST %s failed after %d/%d attempts: %s",
-                url,
-                retries,
-                retries,
-                last_exc,
-            )
-        if isinstance(last_exc, (httpx.TimeoutException, asyncio.TimeoutError)):
-            return _CallResult(status="error", text=json.dumps({"error": "timeout"}), raw=None)
-        if isinstance(last_exc, httpx.HTTPStatusError):
-            e = last_exc
-            assert isinstance(e, httpx.HTTPStatusError)
-            return _CallResult(
-                status="error",
-                text=json.dumps({"error": f"http {e.response.status_code}", "detail": e.response.text}, ensure_ascii=False),
-                raw=None,
-            )
-        return _CallResult(status="error", text=json.dumps({"error": str(last_exc) if last_exc else "unknown"}, ensure_ascii=False), raw=None)
+                    except (httpx.TimeoutException, asyncio.TimeoutError) as e:
+                        last_exc = e
+                        logger.warning(
+                            "POST %s attempt %d/%d timeout: %s",
+                            url,
+                            attempt,
+                            retries,
+                            e,
+                        )
+                    except httpx.HTTPStatusError as e:
+                        last_exc = e
+                        logger.warning(
+                            "POST %s attempt %d/%d HTTP error: %s",
+                            url,
+                            attempt,
+                            retries,
+                            e,
+                        )
+                    except Exception as e:
+                        last_exc = e
+                        logger.warning(
+                            "POST %s attempt %d/%d failed: %s",
+                            url,
+                            attempt,
+                            retries,
+                            e,
+                        )
+                    # 达到这里说明本次尝试失败
+                    if attempt == retries:
+                        break
+                    await asyncio.sleep(min(3 * attempt + 0.1, 10))
+
+            # 最终失败，记录 error，再按异常类型返回
+            if last_exc is not None:
+                logger.error(
+                    "POST %s failed after %d/%d attempts: %s",
+                    url,
+                    retries,
+                    retries,
+                    last_exc,
+                )
+            if isinstance(last_exc, (httpx.TimeoutException, asyncio.TimeoutError)):
+                return _CallResult(status="error", text=json.dumps({"error": "timeout"}), raw=None)
+            if isinstance(last_exc, httpx.HTTPStatusError):
+                e = last_exc
+                assert isinstance(e, httpx.HTTPStatusError)
+                return _CallResult(
+                    status="error",
+                    text=json.dumps({"error": f"http {e.response.status_code}", "detail": e.response.text}, ensure_ascii=False),
+                    raw=None,
+                )
+            return _CallResult(status="error", text=json.dumps({"error": str(last_exc) if last_exc else "unknown"}, ensure_ascii=False), raw=None)
+
+        semaphore = await self._get_tool_semaphore(resolved_name)
+        if semaphore is None:
+            return await _execute_request()
+        async with semaphore:
+            return await _execute_request()
+
+    async def _get_tool_semaphore(self, resolved_tool_name: str) -> Optional[asyncio.Semaphore]:
+        if self.rate_limit is None:
+            return None
+        semaphore = self.tool_semaphores.get(resolved_tool_name)
+        if semaphore is not None:
+            return semaphore
+        if self._semaphore_creation_lock is None:
+            self._semaphore_creation_lock = asyncio.Lock()
+        async with self._semaphore_creation_lock:
+            semaphore = self.tool_semaphores.get(resolved_tool_name)
+            if semaphore is None:
+                semaphore = asyncio.Semaphore(self.rate_limit)
+                self.tool_semaphores[resolved_tool_name] = semaphore
+        return semaphore
 
     def _should_process_with_browser_agent(self, tool_name: str) -> bool:
         try:
@@ -410,7 +437,7 @@ Please process the following webpage or local file content and user goal to extr
         effective_timeout = float(self.browser_agent_timeout or self.timeout)
 
         last_exc: Optional[Exception] = None
-        max_attempts = 5
+        max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             try:
                 client = OpenAI(api_key=self.browser_agent_key, base_url=self.browser_agent_url)
@@ -501,7 +528,7 @@ Please process the following webpage or local file content and user goal to extr
                 except Exception as _truncate_exc:
                     logger.debug("truncate on retry ignored due to error: %s", _truncate_exc)
 
-                await asyncio.sleep(min(2 * attempt, 10))
+                await asyncio.sleep(min(2 * attempt, 20))
 
         # 所有重试失败
         if last_exc is not None:

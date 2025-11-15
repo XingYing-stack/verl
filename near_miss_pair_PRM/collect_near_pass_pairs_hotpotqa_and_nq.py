@@ -23,7 +23,9 @@ from pathlib import Path
 from typing import Optional
 from openai import OpenAI
 from omegaconf import OmegaConf
-
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 
@@ -137,6 +139,8 @@ def _llm_scorer_function(model_answer: str, ground_truth: str, question: str, mo
 
         except Exception as e:
             print("llm_scorer attempt %d failed: %s", i + 1, e)
+            time.sleep(i ** 2+ 1 )
+
 
     raise Exception("llm_scorer failed")
 
@@ -146,6 +150,8 @@ def llm_scorer(prediction, golden_answers, question, model):
     prediction = extract_solution(prediction)
     if isinstance(golden_answers, str):
         golden_answers = [golden_answers]
+    if prediction is None:
+        return 0
     normalized_prediction = normalize_answer(prediction)
     score = 0
     for golden_answer in golden_answers:
@@ -160,7 +166,7 @@ def llm_scorer(prediction, golden_answers, question, model):
 
 tokenizer = AutoTokenizer.from_pretrained("/workspace/models/Qwen/Qwen2.5-1.5B-Instruct")
 
-MAX_WORKERS = max(1, int(os.environ.get("NEAR_PASS_WORKERS", 32)))
+MAX_WORKERS = max(1, int(os.environ.get("NEAR_PASS_WORKERS", 1)))
 tokenizer_lock = threading.Lock()
 
 OPENAI_BASE_URL = os.environ.get("NEAR_PASS_OPENAI_BASE", "http://localhost:8888/v1")
@@ -210,7 +216,7 @@ def _score_and_render_sample(sample):
     # Tokenizer is not documented as thread-safe; guard the call.
     with tokenizer_lock:
         processed['output'] = tokenizer.apply_chat_template(processed['messages'][2:], tokenize=False)
-
+        processed['output'] = processed['output'][processed['output'].index('<|im_start|>assistant'):]
     return processed['question'], processed
 
 
@@ -274,9 +280,26 @@ for query, sample_bucket in tqdm(contrastive_query2sample.items()):
 
     all_near_miss_pairs.extend(query_pairs)
 
+#
+# # 1108 ： LLM judge
+# with open('./input_data/near_miss_pairs_1108.pkl', 'wb') as f:
+#     pickle.dump(all_near_miss_pairs, f)
+#
+# print('length:',len(all_near_miss_pairs))
 
-# 1108 ： LLM judge
-with open('./input_data/near_miss_pairs_1108.pkl', 'wb') as f:
-    pickle.dump(all_near_miss_pairs, f)
 
-print('length:',len(all_near_miss_pairs))
+rows = []
+for q, p1, p2, sim in all_near_miss_pairs:
+    rows.append({
+        "question": str(q),
+        'ground_truth': p1['ground_truth'],
+        "pos_out": p1[1]["output"],   # ← 只写 output 文本
+        "neg_out": p2[1]["output"],   # ← 只写 output 文本
+        "similarity": float(sim),
+    })
+
+df = pd.DataFrame(rows)
+
+# 最优压缩（速度和大小的折中）
+table = pa.Table.from_pandas(df, preserve_index=False)
+pq.write_table(table, './input_data/near_miss_pairs_1108.parquet', compression='zstd')

@@ -15,7 +15,7 @@ import random
 
 import json
 
-def split_trajectory(ori_traj: str):
+def split_trajectory(ori_traj: str, special_token):
     """
     Split a trajectory string into structured steps (including tool calls and final answer).
     Each step will include a step_id and step_type, making it easier to count steps later.
@@ -169,43 +169,21 @@ if __name__ == "__main__":
             tag1, traj1 = example[2]
             tag2, traj2 = example[1]
 
-        system_message = deepcopy(SYSTEM_PROMPT_TEMPLATE)
-        # debug: 把system prompt去掉
-        traj1['output'] = traj1['output'].replace('<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>', '').strip()
-
-        traj2['output'] = traj2['output'].replace('<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>', '').strip()
-
-        #
-
-
-        traj1, traj2 = split_trajectory(traj1['output']), split_trajectory(traj2['output'])
-
-        user_prompt = USER_PROMPT_TEMPLATE.format(question=question, trajectory_1=traj1, trajectory_2=traj2)
-        solution = {'trajectory_1': tag1, 'trajectory_2': tag2}
-
         data = {
             "data_source": data_source,
-            "prompt": [
-                {
-                    "role": "system",
-                    "content": system_message,
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                }],
-            "ability": "pair_comparison",
+            "prompt": traj1['messages'],
+            "ability": "prm",
             "reward_model": {
                 "style": "rule",
-                "ground_truth": solution
+                "ground_truth": tag1
             },
             "extra_info": {
                 # placeholder; will be assigned after grouping by dataset_name
                 'split': 'train',
                 'index': idx,
                 'question': question,
-                'trajectory_1': traj1,
-                'trajectory_2': traj2,
+                'trajectory': traj1,
+                'anchor': traj2,
                 "need_tools_kwargs": False,
                 'dataset_name': dataset_name
                 # Ensure non-empty per-tool kwargs to avoid PyArrow struct<> write error
@@ -249,8 +227,8 @@ if __name__ == "__main__":
     # Save train/validation datasets
     local_dir = args.local_dir
     os.makedirs(local_dir, exist_ok=True)
-    train_path = os.path.join(local_dir, 'train_1108.parquet')
-    val_path = os.path.join(local_dir, 'validation_1108.parquet')
+    train_path = os.path.join(local_dir, 'anchor_train_1112.parquet')
+    val_path = os.path.join(local_dir, 'anchor_validation_1112.parquet')
     train_dataset.to_parquet(train_path)
     validation_dataset.to_parquet(val_path)
 

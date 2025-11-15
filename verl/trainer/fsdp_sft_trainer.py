@@ -47,6 +47,7 @@ import verl.utils.hdfs_io as hdfs_io
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, get_checkpoint_tracker_filename
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset import SFTDataset
+from verl.utils.dataset.marker_anchored_multiturn_sft_dataset import MarkerAnchoredMultiTurnSFTDataset
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available
 from verl.utils.distributed import destroy_global_process_group, initialize_global_process_group
@@ -840,11 +841,20 @@ def create_sft_dataset(data_paths, data_config, tokenizer):
 
         dataset_cls = load_extern_type(data_config.custom_cls.path, data_config.custom_cls.name)
     # Then check if multi-turn dataset should be used
-    elif data_config.get("multiturn", {}).get("enable", False):
-        dataset_cls = MultiTurnSFTDataset
-    # Default to single-turn dataset
     else:
-        dataset_cls = SFTDataset
+        marker_cfg = data_config.get("marker_anchor", {})
+        use_marker_dataset = marker_cfg.get("enable", False)
+        multiturn_enabled = data_config.get("multiturn", {}).get("enable", False)
+
+        if use_marker_dataset:
+            if not multiturn_enabled:
+                raise ValueError("marker_anchor.* requires data.multiturn.enable=True")
+            dataset_cls = MarkerAnchoredMultiTurnSFTDataset
+        elif multiturn_enabled:
+            dataset_cls = MultiTurnSFTDataset
+        else:
+            # Default to single-turn dataset
+            dataset_cls = SFTDataset
 
     # Create datasets based on the selected class
     dataset = dataset_cls(parquet_files=data_paths, tokenizer=tokenizer, config=data_config)

@@ -85,6 +85,14 @@ async def initialize_agentcpm_mcp_tool(tool_cls, tool_config) -> list:
     base = cfg["mcpServers"]["http-agentmcp"]["url"]
     timeout = tool_config.config.timeout
     retries = tool_config.config.retries
+    rate_limit = None
+    try:
+        rl_val = tool_config.config.get("rate_limit", None)
+        if rl_val is not None:
+            rate_limit = int(rl_val)
+    except Exception as exc:
+        logger.warning(f"Invalid rate_limit value '{tool_config.config.get('rate_limit', None)}': {exc}")
+        rate_limit = None
     # 读取可选的 browser_agent 配置并转为普通 dict
     browser_agent = None
     try:
@@ -95,10 +103,18 @@ async def initialize_agentcpm_mcp_tool(tool_cls, tool_config) -> list:
     logger.info(f"mcp base: {base}")
     logger.info(f"mcp timeout: {timeout}")
     logger.info(f"mcp retries: {retries}")
+    if rate_limit:
+        logger.info(f"mcp rate_limit per tool: {rate_limit}")
 
 
     # 1) 初始化 REST Manager，并缓存到 RESTMCPTool 的类属性，供所有实例共享
-    rest_mgr = RESTManager(manager_url=base, timeout=timeout, retries=retries, browser_agent=browser_agent)
+    rest_mgr = RESTManager(
+        manager_url=base,
+        timeout=timeout,
+        retries=retries,
+        browser_agent=browser_agent,
+        rate_limit=rate_limit,
+    )
     ok = await rest_mgr.initialize()
 
     assert ok, "REST MCPManager 初始化失败"
