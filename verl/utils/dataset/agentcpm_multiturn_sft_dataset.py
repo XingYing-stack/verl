@@ -73,6 +73,7 @@ class AgentCPMMultiTurnSFTDataset(MultiTurnSFTDataset):
         multiturn_config = config.get("multiturn", {})
         self.messages_key = multiturn_config.get("messages_key", "messages")
         self.tools_key = multiturn_config.get("tools_key", "tools")
+        self.filter_empty = multiturn_config.get("filter_empty", False)
 
         self.enable_thinking = config.get("enable_thinking", True)
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
@@ -104,6 +105,8 @@ class AgentCPMMultiTurnSFTDataset(MultiTurnSFTDataset):
             sharegpt_data = json.load(open(json_file, 'r'))
 
             self.data += sharegpt_data
+
+        self._maybe_filter_empty_samples()
 
         # Extract ShareGPT messages list from dataframe
         self.messages = [convert_sharegpt_to_conversation(sharegpt_sample) for sharegpt_sample in self.data]
@@ -227,6 +230,22 @@ class AgentCPMMultiTurnSFTDataset(MultiTurnSFTDataset):
             "loss_mask": loss_mask,
         }
 
+    def _maybe_filter_empty_samples(self):
+        if not self.filter_empty:
+            return
+
+        def empty_sample(sample):
+            for conv in sample['conversations']:
+                if conv['from'] == 'gpt':
+                    if '<tool_call>' in conv['value']:
+                        continue
+                    if '<answer>' in conv['value']:
+                        continue
+                    return True
+            return False
+
+        self.data = [sample for sample in self.data if not empty_sample(sample)]
+
     def _maybe_filter_overlong_prompts(self) -> None:
         if not self.filter_overlong_prompts or self.max_prompt_length is None:
             if self.filter_overlong_prompts:
@@ -295,7 +314,7 @@ if __name__ == "__main__":
 
     # Initialize tokenizer and dataset
     tokenizer = AutoTokenizer.from_pretrained("/workspace/models/Qwen/Qwen3-4B-Thinking-2507-keep-empty-think")
-    config = {"max_length": 64000, "truncation": "error", "multiturn": {"messages_key": "conversations"}}
+    config = {"max_length": 64000, "truncation": "error", "multiturn": {"messages_key": "conversations", 'filter_empty': True}}
 
     dataset = AgentCPMMultiTurnSFTDataset(json_files=json_files, tokenizer=tokenizer, config=config)
 

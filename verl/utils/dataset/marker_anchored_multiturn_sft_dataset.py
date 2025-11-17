@@ -79,6 +79,11 @@ class MarkerAnchoredMultiTurnSFTDataset(MultiTurnSFTDataset):
                 "MarkerAnchoredMultiTurnSFTDataset: encoding marker token produced an empty id sequence. "
                 "Ensure the tokenizer vocabulary contains the marker (e.g. '<extra_0>')."
             )
+        
+        
+        
+        self._trajectory_labels = [{'positive':1, 'negative':0}[sample['ground_truth']] for sample in self.dataframe['reward_model'].tolist()]
+
         self._marker_token_ids = marker_token_ids
 
 
@@ -86,7 +91,28 @@ class MarkerAnchoredMultiTurnSFTDataset(MultiTurnSFTDataset):
 
     def __getitem__(self, item):
         tokenizer = self.tokenizer
+
         messages = self.messages[item]
+        # 1) 外层 np.ndarray -> list
+        if isinstance(messages, np.ndarray):
+            messages = messages.tolist()
+
+        normalized = []
+        for m in messages:
+            # 有些 parquet 读出来可能是 tuple / 其他类型，统一成 dict
+            if not isinstance(m, dict):
+                m = dict(m)
+
+            tc = m.get("tool_calls", None)
+            # 2) 内层 tool_calls 的 np.ndarray -> list
+            if isinstance(tc, np.ndarray):
+                m["tool_calls"] = tc.tolist()
+
+            normalized.append(m)
+
+        messages = normalized
+
+
         tools = self.tools[item] if self.tools is not None else None
         enable_thinking = self.enable_thinking[item] if self.enable_thinking is not None else None
 
@@ -193,6 +219,7 @@ class MarkerAnchoredMultiTurnSFTDataset(MultiTurnSFTDataset):
             "attention_mask": attention_mask,
             "position_ids": position_ids,
             "loss_mask": loss_mask,
+            'trajectory_labels': self._trajectory_labels[item]
         }
 
 
@@ -216,6 +243,8 @@ class MarkerAnchoredMultiTurnSFTDataset(MultiTurnSFTDataset):
             tools=tools,
         )
 
+        loss_mask = [0] * len(loss_mask)
+
         if (
             self._marker_enabled
             and is_tool
@@ -226,6 +255,12 @@ class MarkerAnchoredMultiTurnSFTDataset(MultiTurnSFTDataset):
             and start_idx == len(messages) - 1
             and self._marker_token_ids
         ):
+        #
+        # if (
+        #     self._marker_enabled
+        #     and start_idx == len(messages) - 1
+        #     and self._marker_token_ids
+        # ):
             # Append marker tokens after the assistant turn so the model produces
             # hidden states at explicit step boundaries.
             tokens = tokens + self._marker_token_ids

@@ -10,7 +10,7 @@ export SWANLAB_WORKSPACE="AgentCPM_MCP"
 export VERL_LOGGING_LEVEL=DEBUG
 
 nproc_per_node=8
-experiment_name=Qwen3-4B-2507-correct-1114-128K
+experiment_name=Qwen3-4B-2507-deepseek-1116-filter_empty
 save_path=/workspace/fanshengda/verl/mcp_agent_ckpts/${experiment_name}
 train_json=$(python - <<'PY'
 import json
@@ -58,7 +58,7 @@ yishan_correct_paths = [
   '/workspace/fanshengda/AgentCPM-MCP/sft_data/tongyi-ds-1114-correct-deepdive_qa_rl_all_messages.json',
   '/workspace/fanshengda/AgentCPM-MCP/sft_data/tongyi-ds-1114-correct-webwalker_silver_13k_all_messages.json'
 ]
-paths = deepseek_paths + tongyi_ASearcher_paths + yishan_correct_paths
+paths = deepseek_paths
 
 print(json.dumps(paths))
 PY
@@ -74,9 +74,10 @@ torchrun --nnodes=1 --nproc_per_node=$nproc_per_node \
     data.max_length=128000 \
     data.train_batch_size=32 \
     optim.warmup_steps_ratio=0.1 \
-    optim.lr=1.5e-5 \
+    optim.lr=2e-5 \
     data.truncation=error \
     +data.enable_thinking=true \
+    +data.multiturn.filter_empty=true \
     data.micro_batch_size_per_gpu=1 \
     model.fsdp_config.model_dtype=bfloat16 \
     model.partial_pretrain=/workspace/models/Qwen/Qwen3-4B-Thinking-2507-keep-empty-think \
@@ -86,7 +87,7 @@ torchrun --nnodes=1 --nproc_per_node=$nproc_per_node \
     trainer.default_local_dir=$save_path \
     trainer.project_name=agentcpm-sft \
     trainer.experiment_name=${experiment_name} \
-    trainer.total_epochs=4 \
+    trainer.total_epochs=3 \
     trainer.logger='["console","swanlab"]' \
     use_remove_padding=true \
     trainer.test_freq=100 \

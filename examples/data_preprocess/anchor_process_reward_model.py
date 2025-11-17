@@ -168,7 +168,27 @@ if __name__ == "__main__":
         else:
             tag1, traj1 = example[2]
             tag2, traj2 = example[1]
-
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "Searches for relevant information based on queries.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query_list": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "List of search queries",
+                            },
+                            "query": {"type": "string", "description": "Single query"},
+                        },
+                        "required": ["query_list"],
+                    },
+                },
+            }
+        ]
         data = {
             "data_source": data_source,
             "prompt": traj1['messages'],
@@ -177,6 +197,7 @@ if __name__ == "__main__":
                 "style": "rule",
                 "ground_truth": tag1
             },
+            'tools': tools,
             "extra_info": {
                 # placeholder; will be assigned after grouping by dataset_name
                 'split': 'train',
@@ -227,8 +248,8 @@ if __name__ == "__main__":
     # Save train/validation datasets
     local_dir = args.local_dir
     os.makedirs(local_dir, exist_ok=True)
-    train_path = os.path.join(local_dir, 'anchor_train_1112.parquet')
-    val_path = os.path.join(local_dir, 'anchor_validation_1112.parquet')
+    train_path = os.path.join(local_dir, 'anchor_train_1116.parquet')
+    val_path = os.path.join(local_dir, 'anchor_validation_1116.parquet')
     train_dataset.to_parquet(train_path)
     validation_dataset.to_parquet(val_path)
 
