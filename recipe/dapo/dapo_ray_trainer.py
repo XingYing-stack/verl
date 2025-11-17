@@ -35,6 +35,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_rollout_metrics,
     reduce_metrics,
 )
+from verl.trainer.ppo.metric_utils import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics
 from verl.trainer.ppo.ray_trainer import (
     AdvantageEstimator,
     RayPPOTrainer,
@@ -42,6 +43,8 @@ from verl.trainer.ppo.ray_trainer import (
     compute_advantage,
     compute_response_mask,
 )
+from verl.trainer.ppo.reward import compute_reward
+from verl.utils.metric import reduce_metrics
 from verl.utils.profiler import marked_timer
 from verl.utils.rollout_skip import RolloutSkip
 
@@ -160,6 +163,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
+
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
                         not prev_step_profile and curr_step_profile
@@ -362,6 +366,15 @@ class RayDAPOTrainer(RayPPOTrainer):
                         with marked_timer("values", timing_raw, "cyan"):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
+
+                    # Compute rollout correction weights and off-policy metrics (inherited from RayPPOTrainer)
+                    from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
+                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+                    if rollout_corr_config is not None and "rollout_log_probs" in batch.batch:
+                        batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch)
+                        # IS and off-policy metrics already have rollout_corr/ prefix
+                        metrics.update(is_metrics)
 
                     with marked_timer("adv", timing_raw, "brown"):
                         # compute advantages, executed on the driver process

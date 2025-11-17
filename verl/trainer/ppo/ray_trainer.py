@@ -58,7 +58,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
-from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 
@@ -347,7 +347,10 @@ class RayPPOTrainer:
         )
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
-        self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
+        self.ref_in_actor = (
+            config.actor_rollout_ref.model.get("lora_rank", 0) > 0
+            or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+        )
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
@@ -365,11 +368,19 @@ class RayPPOTrainer:
 
         if train_dataset is None:
             train_dataset = create_rl_dataset(
-                self.config.data.train_files, self.config.data, self.tokenizer, self.processor
+                self.config.data.train_files,
+                self.config.data,
+                self.tokenizer,
+                self.processor,
+                max_samples=self.config.data.get("train_max_samples", -1),
             )
         if val_dataset is None:
             val_dataset = create_rl_dataset(
-                self.config.data.val_files, self.config.data, self.tokenizer, self.processor
+                self.config.data.val_files,
+                self.config.data,
+                self.tokenizer,
+                self.processor,
+                max_samples=self.config.data.get("val_max_samples", -1),
             )
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
@@ -458,6 +469,38 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
+    def _log_rollout_data(
+        self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
+    ):
+        """Log rollout data to disk.
+        Args:
+            batch (DataProto): The batch containing rollout data
+            reward_extra_infos_dict (dict): Additional reward information to log
+            timing_raw (dict): Timing information for profiling
+            rollout_data_dir (str): Directory path to save the rollout data
+        """
+        with marked_timer("dump_rollout_generations", timing_raw, color="green"):
+            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+            sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
+
+            reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
+            if "request_id" in batch.non_tensor_batch:
+                reward_extra_infos_dict.setdefault(
+                    "request_id",
+                    batch.non_tensor_batch["request_id"].tolist(),
+                )
+
+            self._dump_generations(
+                inputs=inputs,
+                outputs=outputs,
+                gts=sample_gts,
+                scores=scores,
+                reward_extra_infos_dict=reward_extra_infos_to_dump,
+                dump_path=rollout_data_dir,
+            )
+
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
@@ -511,9 +554,15 @@ class RayPPOTrainer:
         sample_gts = []
         sample_scores = []
         sample_turns = []
+        sample_uids = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
+
+            if "uid" not in test_batch.non_tensor_batch:
+                test_batch.non_tensor_batch["uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
+                )
 
             # repeat test batch
             test_batch = test_batch.repeat(
@@ -529,6 +578,7 @@ class RayPPOTrainer:
             # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
+            sample_uids.extend(test_batch.non_tensor_batch["uid"])
 
             ground_truths = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
@@ -626,7 +676,7 @@ class RayPPOTrainer:
 
         data_sources = np.concatenate(data_source_lst, axis=0)
 
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
+        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
@@ -673,9 +723,9 @@ class RayPPOTrainer:
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.ActorRollout],
                 config=self.config.actor_rollout_ref,
-                role="actor_rollout",
+                role=str(Role.ActorRollout),
             )
-            self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
+            self.resource_pool_to_cls[resource_pool][str(Role.ActorRollout)] = actor_rollout_cls
         else:
             raise NotImplementedError
 
@@ -684,7 +734,7 @@ class RayPPOTrainer:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
             critic_cfg = omega_conf_to_dataclass(self.config.critic)
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
-            self.resource_pool_to_cls[resource_pool]["critic"] = critic_cls
+            self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
 
         # create reference policy if needed
         if self.use_reference_policy:
@@ -692,16 +742,16 @@ class RayPPOTrainer:
             ref_policy_cls = RayClassWithInitArgs(
                 self.role_worker_mapping[Role.RefPolicy],
                 config=self.config.actor_rollout_ref,
-                role="ref",
+                role=str(Role.RefPolicy),
             )
-            self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
+            self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
 
         # create a reward model if reward_fn is None
         if self.use_rm:
             # we create a RM here
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
-            self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
+            self.resource_pool_to_cls[resource_pool][str(Role.RewardModel)] = rm_cls
 
         # initialize WorkerGroup
         # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
@@ -737,19 +787,21 @@ class RayPPOTrainer:
             all_wg.update(spawn_wg)
         # =================================
         if self.use_critic:
-            self.critic_wg = all_wg["critic"]
+            self.critic_wg = all_wg[str(Role.Critic)]
             self.critic_wg.init_model()
 
         if self.use_reference_policy and not self.ref_in_actor:
-            self.ref_policy_wg = all_wg["ref"]
+            self.ref_policy_wg = all_wg[str(Role.RefPolicy)]
             self.ref_policy_wg.init_model()
 
+        self.rm_wg = None
+        # initalization of rm_wg will be deprecated in the future
         if self.use_rm:
-            self.rm_wg = all_wg["rm"]
+            self.rm_wg = all_wg[str(Role.RewardModel)]
             self.rm_wg.init_model()
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.actor_rollout_wg = all_wg["actor_rollout"]
+        self.actor_rollout_wg = all_wg[str(Role.ActorRollout)]
         self.actor_rollout_wg.init_model()
 
         # create async rollout manager and request scheduler
@@ -759,8 +811,7 @@ class RayPPOTrainer:
 
             self.async_rollout_mode = True
             self.async_rollout_manager = AgentLoopManager(
-                config=self.config,
-                worker_group=self.actor_rollout_wg,
+                config=self.config, worker_group=self.actor_rollout_wg, rm_wg=self.rm_wg
             )
 
     def _save_checkpoint(self):
@@ -798,11 +849,13 @@ class RayPPOTrainer:
         )
 
         if self.use_critic:
-            critic_local_path = os.path.join(local_global_step_folder, "critic")
+            critic_local_path = os.path.join(local_global_step_folder, str(Role.Critic))
             critic_remote_path = (
                 None
                 if self.config.trainer.default_hdfs_dir is None
-                else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "critic")
+                else os.path.join(
+                    self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", str(Role.Critic)
+                )
             )
             self.critic_wg.save_checkpoint(
                 critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
@@ -823,6 +876,8 @@ class RayPPOTrainer:
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
+            # NOTE: while there is no checkpoint to load, we still need to offload the model and optimizer to CPU
+            self.actor_rollout_wg.load_checkpoint(None)
             return 0
 
         # load from hdfs
@@ -839,6 +894,7 @@ class RayPPOTrainer:
         if self.config.trainer.resume_mode == "auto":
             if global_step_folder is None:
                 print("Training from scratch")
+                self.actor_rollout_wg.load_checkpoint(None)
                 return 0
         else:
             if self.config.trainer.resume_mode == "resume_path":
@@ -858,7 +914,7 @@ class RayPPOTrainer:
         print(f"Resuming from {global_step_folder}")
 
         actor_path = os.path.join(global_step_folder, "actor")
-        critic_path = os.path.join(global_step_folder, "critic")
+        critic_path = os.path.join(global_step_folder, str(Role.Critic))
         # load actor
         self.actor_rollout_wg.load_checkpoint(
             actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
@@ -900,15 +956,35 @@ class RayPPOTrainer:
             if self.use_rm:
                 self.rm_wg.stop_profile()
 
-    def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
+    def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch["attention_mask"]
         batch_size = attention_mask.shape[0]
-        global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
+        global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,)
+        global_seqlen_lst = calculate_workload(global_seqlen_lst)
         world_size = self.actor_rollout_wg.world_size
-        global_partition_lst = get_seqlen_balanced_partitions(
-            global_seqlen_lst, k_partitions=world_size, equal_size=True
-        )
+        if keep_minibatch:
+            # Decouple the DP balancing and mini-batching.
+            minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size")
+            minibatch_num = len(global_seqlen_lst) // minibatch_size
+            global_partition_lst = [[] for _ in range(world_size)]
+            for i in range(minibatch_num):
+                rearrange_minibatch_lst = get_seqlen_balanced_partitions(
+                    global_seqlen_lst[i * minibatch_size : (i + 1) * minibatch_size],
+                    k_partitions=world_size,
+                    equal_size=True,
+                )
+                for j, part in enumerate(rearrange_minibatch_lst):
+                    global_partition_lst[j].extend([x + minibatch_size * i for x in part])
+        else:
+            global_partition_lst = get_seqlen_balanced_partitions(
+                global_seqlen_lst, k_partitions=world_size, equal_size=True
+            )
+        # Place smaller micro-batches at both ends to reduce the bubbles in pipeline parallel.
+        for idx, partition in enumerate(global_partition_lst):
+            partition.sort(key=lambda x: (global_seqlen_lst[x], x))
+            ordered_partition = partition[::2] + partition[1::2][::-1]
+            global_partition_lst[idx] = ordered_partition
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
         global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
         batch.reorder(global_idx)
@@ -1052,7 +1128,7 @@ class RayPPOTrainer:
 
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
-                        if self.use_rm:
+                        if self.use_rm and "rm_scores" not in batch.batch.keys():
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
@@ -1061,27 +1137,42 @@ class RayPPOTrainer:
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
-                    # recompute old_log_probs
-                    with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                        metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
-                        batch = batch.union(old_log_prob)
+                    from verl.trainer.ppo.rollout_corr_helper import (
+                        compute_rollout_correction_and_add_to_batch,
+                        maybe_apply_rollout_correction,
+                    )
 
-                        if "rollout_log_probs" in batch.batch.keys():
-                            # TODO: we may want to add diff of probs too.
-                            from verl.utils.debug.metrics import calculate_debug_metrics
+                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+                    need_recomputation = maybe_apply_rollout_correction(
+                        batch=batch,
+                        rollout_corr_config=rollout_corr_config,
+                        policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
+                    )
+                    if need_recomputation:
+                        # LEGACY MODE: Compute old_log_probs from actor
+                        with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            entropys = old_log_prob.batch["entropys"]
+                            response_masks = batch.batch["response_mask"]
+                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                            entropy_agg = agg_loss(
+                                loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
+                            )
+                            old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                            metrics.update(old_log_prob_metrics)
+                            old_log_prob.batch.pop("entropys")
+                            batch = batch.union(old_log_prob)
+                            if "rollout_log_probs" in batch.batch.keys():
+                                # TODO: we may want to add diff of probs too.
+                                from verl.utils.debug.metrics import calculate_debug_metrics
 
-                            metrics.update(calculate_debug_metrics(batch))
+                                metrics.update(calculate_debug_metrics(batch))
+
+                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
                     if self.use_reference_policy:
                         # compute reference log_prob
-                        with marked_timer("ref", timing_raw, color="olive"):
+                        with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             if not self.ref_in_actor:
                                 ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             else:
@@ -1112,6 +1203,14 @@ class RayPPOTrainer:
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                        # Compute rollout correction weights centrally (once per batch)
+                        # This corrects for off-policy issues (policy mismatch, model staleness, etc.)
+                        # Also computes off-policy diagnostic metrics (KL, PPL, etc.)
+                        if rollout_corr_config is not None and "rollout_log_probs" in batch.batch:
+                            batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch)
+                            # IS and off-policy metrics already have rollout_corr/ prefix
+                            metrics.update(is_metrics)
 
                         # compute advantages, executed on the driver process
 
@@ -1148,29 +1247,7 @@ class RayPPOTrainer:
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
-                        with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-                            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-                            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-                            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
-                            sample_gts = [
-                                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
-                                for item in batch
-                            ]
-
-                            if "request_id" in batch.non_tensor_batch:
-                                reward_extra_infos_dict.setdefault(
-                                    "request_id",
-                                    batch.non_tensor_batch["request_id"].tolist(),
-                                )
-
-                            self._dump_generations(
-                                inputs=inputs,
-                                outputs=outputs,
-                                gts=sample_gts,
-                                scores=scores,
-                                reward_extra_infos_dict=reward_extra_infos_dict,
-                                dump_path=rollout_data_dir,
-                            )
+                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
                 if (
@@ -1247,6 +1324,8 @@ class RayPPOTrainer:
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
+
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)

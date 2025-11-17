@@ -36,14 +36,10 @@ from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
-from verl.trainer.ppo.metric_utils import (
-    compute_throughout_metrics,
-    compute_timing_metrics,
-    process_validation_metrics,
-    reduce_metrics,
-)
+from verl.trainer.ppo.metric_utils import compute_throughout_metrics, compute_timing_metrics, process_validation_metrics
 from verl.trainer.ppo.utils import Role, WorkerType, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
+from verl.utils.metric import reduce_metrics
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -83,7 +79,7 @@ class ResourcePoolManager:
 
     def _check_resource_available(self):
         """Check if the resource pool can be satisfied in this ray cluster."""
-        node_available_resources = ray.state.available_resources_per_node()
+        node_available_resources = ray._private.state.available_resources_per_node()
         node_available_gpus = {node: node_info.get("GPU", 0) for node, node_info in node_available_resources.items()}
 
         # check total required gpus can be satisfied
@@ -393,11 +389,19 @@ class RaySPINTrainer:
 
         if train_dataset is None:
             train_dataset = create_rl_dataset(
-                self.config.data.train_files, self.config.data, self.tokenizer, self.processor
+                self.config.data.train_files,
+                self.config.data,
+                self.tokenizer,
+                self.processor,
+                max_samples=self.config.data.get("train_max_samples", -1),
             )
         if val_dataset is None:
             val_dataset = create_rl_dataset(
-                self.config.data.val_files, self.config.data, self.tokenizer, self.processor
+                self.config.data.val_files,
+                self.config.data,
+                self.tokenizer,
+                self.processor,
+                max_samples=self.config.data.get("val_max_samples", -1),
             )
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
@@ -565,9 +569,13 @@ class RaySPINTrainer:
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
+            sample_gts = [
+                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
+            ]
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
+                gts=sample_gts,
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
