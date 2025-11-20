@@ -1,217 +1,124 @@
-# conda activate /home/test/test03/miniconda3/envs/fsd
-
 import os
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
+from typing import Dict, Any, List
 
+import numpy as np
 import torch
-import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import Subset
+
 from transformers import (
     AutoTokenizer,
-    default_data_collator,
+    AutoModelForTokenClassification,
+    Trainer,
+    TrainingArguments,
 )
-from trl import SFTTrainer, SFTConfig, RewardTrainer
-from datasets import Dataset
 
-from torch.optim import AdamW
-
-from transformers import get_cosine_schedule_with_warmup
-import torch.distributed as dist
+from verl.utils.dataset.marker_anchored_multiturn_sft_dataset import MarkerAnchoredMultiTurnSFTDataset
 from accelerate import Accelerator
-from accelerate.utils import gather_object
-import warnings
-
-warnings.filterwarnings("ignore")
-import swanlab
-from datetime import timedelta
-
-
-if os.getenv('PYCHARM_HOSTED') != '1':
-    dist.init_process_group(backend='nccl', timeout=timedelta(hours=6))
-    # Initialize the Accelerator
 accelerator = Accelerator(mixed_precision='bf16')
-
 
 # 只在主进程做一次副作用操作（登录/初始化/创建目录/写配置等）
 if accelerator.is_main_process:
     os.environ["SWANLAB_API_KEY"] = "WoZrF9qolYJjzYBCfArih"     # <<< 填你的 key
 
-# 你自己的文件：Qwen2ForProcessRewardModel 定义和权重加载逻辑
-from near_miss_pair_PRM.modeling_qwen2_rm import Qwen2ForProcessRewardModel
-# 你上面贴的 Dataset 基类
-from verl.utils.dataset.marker_anchored_multiturn_sft_dataset import MarkerAnchoredMultiTurnSFTDataset
 
 
+# ============ 只在最后一个非 PAD 位置打 label 的 collator ============
+class DataCollatorForLastTokenClassification:
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        # 明确只取这几个 key，避免各种奇怪类型
+        input_ids_list = [f["input_ids"] for f in features]
+        attention_mask_list = [f["attention_mask"] for f in features]
+        traj_label_list = [f["trajectory_labels"] for f in features]
 
-# ============================================================
-# 1. 实现 Marker-Anchored Step Scoring 的核心函数
-# ============================================================
+        # input_ids / attention_mask 一般已经是 tensor，直接 stack
+        input_ids = torch.stack(input_ids_list)           # (B, L)
+        attention_mask = torch.stack(attention_mask_list) # (B, L)
 
-def marker_anchored_sum_of_logits_bce(
-    step_logits: torch.Tensor,
-    marker_mask: torch.Tensor,
-    traj_labels: torch.Tensor,
-    alpha: float = 1.0,
-    beta: float = 0.0,
-    gamma: float = 0.0,
-) -> torch.Tensor:
+        # trajectory_labels 可能是 int 也可能是 tensor，统一变成 (B,)
+        if isinstance(traj_label_list[0], torch.Tensor):
+            traj_labels = torch.stack(traj_label_list).view(-1).long()
+        else:
+            traj_labels = torch.tensor(traj_label_list, dtype=torch.long)
+
+        B, L = input_ids.shape
+        labels = torch.full((B, L), fill_value=-100, dtype=torch.long)
+
+        # 最后一个非 PAD 的 index：attention_mask.sum(dim=-1) - 1
+        last_indices = attention_mask.sum(dim=-1) - 1
+        last_indices = last_indices.clamp(min=0)
+
+        for i in range(B):
+            idx = last_indices[i].item()
+            labels[i, idx] = traj_labels[i].item()
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
+
+# ==================== 评估指标 ====================
+def compute_metrics(eval_pred):
     """
-    对应伪代码中的：
-
-      z_{i,t}: step-level logit at marker
-      s_i    = sum_t z_{i,t}
-      K_i    = number of markers
-      Z_i    = alpha * s_i - gamma * log(K_i) + beta
-      L      = BCEWithLogits(Z_i, y_i)
-
-    参数:
-      step_logits: (B, L)，比如取 logits[..., 1] 后得到的正类 logit
-      marker_mask: (B, L) bool/0-1，1 表示该位置是 step-end marker
-      traj_labels: (B,) 0/1 轨迹标签
+    eval_pred.predictions: (B, L, C)  token 分类 logits
+    eval_pred.label_ids:  (B, L)      只有一个位置是 0/1，其余为 -100
     """
-    # 保证类型
-    marker_mask = marker_mask.to(torch.bool)
-    step_logits = step_logits.float()
-    traj_labels = traj_labels.float()
+    logits = eval_pred.predictions          # np.ndarray, (B, L, C)
+    labels = eval_pred.label_ids            # np.ndarray, (B, L)
 
-    # 只在 marker 位置上保留 logit，其余位置为 0
-    masked_logits = step_logits * marker_mask  # (B, L)
+    pred_ids = logits.argmax(-1)            # (B, L)
 
-    # s_i = sum_{t in T_i} z_{i,t}
-    s = masked_logits.sum(dim=-1)  # (B,)
+    mask = labels != -100                   # (B, L)
+    if mask.sum() == 0:
+        return {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
 
-    # K_i = |T_i|，避免 log(0)，用 clamp(min=1)
-    K = marker_mask.sum(dim=-1).clamp(min=1).to(step_logits.dtype)  # (B,)
+    y_true = labels[mask].astype(np.int64)  # (N,)
+    y_pred = pred_ids[mask].astype(np.int64)
 
-    # Z_i = alpha * s_i - gamma * log(K_i) + beta
-    Z = alpha * s - gamma * torch.log(K) + beta  # (B,)
+    tp = int(((y_pred == 1) & (y_true == 1)).sum())
+    tn = int(((y_pred == 0) & (y_true == 0)).sum())
+    fp = int(((y_pred == 1) & (y_true == 0)).sum())
+    fn = int(((y_pred == 0) & (y_true == 1)).sum())
 
-    # 直接用 BCE with logits，等价于 sigmoid + BCE 但数值更稳定
-    loss = F.binary_cross_entropy_with_logits(Z, traj_labels)
+    def safe_div(n, d):
+        return float(n) / float(d) if d != 0 else 0.0
 
-    return loss, Z
+    accuracy  = safe_div(tp + tn, tp + tn + fp + fn)
+    precision = safe_div(tp, tp + fp)
+    recall    = safe_div(tp, tp + fn)
+    f1        = safe_div(2 * precision * recall, precision + recall) if (precision + recall) > 0 else 0.0
 
+    return {
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }
 
-# ============================================================
-# 3. 自定义 Trainer：在 compute_loss 里实现伪代码
-# ============================================================
-
-@dataclass
-class MarkerPRMConfig(SFTConfig):
-    """
-    在 SFTConfig 上加上三个超参数：
-      alpha, beta, gamma
-    对应伪代码里的 (α, β, γ)
-
-    如果你暂时不想学这些参数，而是把它们固定为常数，
-    就用这里的值即可。
-    """
-    alpha: float = field(default=1.0)
-    beta: float = field(default=0.0)
-    gamma: float = field(default=0.0)
-
-
-class MarkerAnchoredPRMTrainer(SFTTrainer):
-    """
-    继承 TRL 的 RewardTrainer，自定义 compute_loss：
-
-    - model: Qwen2ForProcessRewardModel（输出 token-level logits [B, L, 2]）
-    - inputs:
-        input_ids, attention_mask, position_ids, loss_mask, trajectory_labels
-    - 不把 labels 传给 model，避免触发内部的 token-level CE
-    """
-
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch: int | None = None, **kwargs):
-        # 取出我们自定义的东西，注意要从 inputs 里 pop 掉，不然会传进 model.forward
-        traj_labels: torch.Tensor = inputs.pop("trajectory_labels")  # (B,)
-        loss_mask: torch.Tensor = inputs.pop("loss_mask")  # (B, L)，<extra_0> 位置为 1
-        attention_mask: Optional[torch.Tensor] = inputs.get("attention_mask", None)
-
-        # 调用模型，只需要 logits，labels 不传，避免内部 CE
-        outputs = model(**inputs, labels=None, return_dict=True)
-        logits = outputs.logits  # (B, L, num_labels=2)，来自 Qwen2ForProcessRewardModel.score
-        print('logits.shape:', logits.shape)
-        # step-level scalar logit z_{i,t}
-        # 这里用正类的 logit（index=1），也可以用 logit1-logit0 形成 log-odds
-        step_logits = logits[..., 1]  # (B, L)
-
-        # marker mask：只在 <extra_0> 且不为 padding 的位置上为 1
-        marker_mask = (loss_mask > 0)
-
-        print('marker_mask.sum(-1):', marker_mask.sum(-1))
-        if attention_mask is not None:
-            marker_mask = marker_mask & attention_mask.bool()
-
-        # 按照伪代码做 sum-of-logits + length normalization + BCE
-        loss, Z = marker_anchored_sum_of_logits_bce(
-            step_logits=step_logits,
-            marker_mask=marker_mask,
-            traj_labels=traj_labels,
-            alpha=self.args.alpha,
-            beta=self.args.beta,
-            gamma=self.args.gamma,
-        )
-        # ==========================
-        # print('num_items_in_batch:', num_items_in_batch)
-        # num_items = num_items_in_batch
-        #
-        # # 放到同一 device，避免分布式/模型并行下的设备不一致
-        # if hasattr(num_items, "device") and num_items.device != logits.device:
-        #     num_items = num_items.to(logits.device)
-        # # 防御 0
-        # num_items = torch.clamp(num_items, min=1)
-        # loss = loss / num_items
-        # loss = loss * self.accelerator.num_processes
-        # ==========================
-        if return_outputs:
-            # 顺便把 trajectory-level logits 也塞回去，方便 eval 记录
-            outputs["trajectory_logits"] = Z
-            return loss, outputs
-
-        return loss
-
-
-
-from datasets import Dataset
-
-
-
-
-# ============================================================
-# 4. 训练脚本入口
-# ============================================================
 
 def main():
-    # ------------ 基本配置 ------------
-    model_name = "/home/test/test12/models/Qwen/Qwen2.5-7B-Instruct"  # 或者你自己的 PRM base
-    output_dir = "/home/test/test12/fanshengda/verl/prm_ckpts"
+    prefix = '/home/test/test12'
 
-    # ------------ Tokenizer & Model ------------
+    model_name = prefix + "/models/Qwen/Qwen2.5-7B-Instruct"
+    output_dir = prefix + "/fanshengda/verl/prm_ckpts_last_token_ce"
+
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
-        # Qwen 通常用 eos_token 作为 pad_token
         tokenizer.pad_token = tokenizer.eos_token
 
-    # 加载官方的 Qwen2ForProcessRewardModel（来自 modeling_qwen2_rm.py）
-    model = Qwen2ForProcessRewardModel.from_pretrained(
+    model = AutoModelForTokenClassification.from_pretrained(
         model_name,
         trust_remote_code=True,
+        num_labels=2,
+        torch_dtype=torch.bfloat16,
+        use_cache=False,
+        attn_implementation="flash_attention_2",
     )
+    model.gradient_checkpointing_enable()
 
-    # ✅ 1. 增加新 token
-    new_tokens = ["<extra_0>"]
-    added = tokenizer.add_tokens(new_tokens)
-    print(f"Added {added} new tokens")
-
-    # ✅ 2. 同步模型 embedding
-    model.resize_token_embeddings(len(tokenizer))
-
-
-
-    # ------------ Dataset ------------
     parquet_paths = [
-        "/home/test/test12/fanshengda/verl/input_data/near_miss_prm/anchor_train_1116.parquet"
+        prefix + "/fanshengda/verl/input_data/near_miss_prm/anchor_train_1116.parquet"
     ]
 
     marker_cfg = {
@@ -228,60 +135,65 @@ def main():
     }
 
 
-    train_dataset = MarkerAnchoredMultiTurnSFTDataset(parquet_files=parquet_paths, tokenizer=tokenizer, config=marker_cfg)
-    # ===== 优化器 & 调度器 =====
-    learning_rate = 2e-5
-    num_train_epochs = 3
-    per_device_train_batch_size = 1
-    gradient_accumulation_steps = 4
-    warmup_ratio = 0.03
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    steps_per_epoch = len(train_dataset) // (per_device_train_batch_size * world_size)
-    total_training_steps = (steps_per_epoch * num_train_epochs) // gradient_accumulation_steps
-
-    optimizer = AdamW(model.parameters(), lr=learning_rate)
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer=optimizer,
-        num_warmup_steps=int(total_training_steps * warmup_ratio),
-        num_training_steps=total_training_steps,
-    )
+    full_dataset = MarkerAnchoredMultiTurnSFTDataset(parquet_files=parquet_paths, tokenizer=tokenizer, config=marker_cfg)
 
 
-    # ------------ TRL SFTConfig ------------
-    training_args = MarkerPRMConfig(
+    sample = full_dataset[0]
+    print('dada')
+    assert "trajectory_labels" in sample, "dataset 需要提供 trajectory_labels (0/1)!"
+
+    # ============ 95% 训练 / 5% 验证 ============
+    N = len(full_dataset)
+    rng = np.random.default_rng(seed=42)
+    indices = np.arange(N)
+    rng.shuffle(indices)
+
+    split = max(1, int(N * 0.95))
+    train_indices = indices[:split].tolist()
+    eval_indices  = indices[split:].tolist()
+
+    train_dataset = Subset(full_dataset, train_indices)
+    eval_dataset  = Subset(full_dataset, eval_indices)
+
+    training_args = TrainingArguments(
         output_dir=output_dir,
-        per_device_train_batch_size=2,
+        per_device_train_batch_size=1,
         gradient_accumulation_steps=2,
+        num_train_epochs=3,
         logging_steps=1,
-        save_steps=100,
+        save_steps=200,
         save_total_limit=3,
-        bf16=True,  # 你的 GPU 支持的话
+        bf16=True,
+        gradient_checkpointing=True,
         max_grad_norm=1.0,
-        # 很关键：保留我们自定义的字段（loss_mask, trajectory_labels）
-        # 关闭 packing，因为我们自己已经在 Dataset 里 control 了长度
-        packing=False,
-        # 伪代码里的 (α, β, γ)
-        alpha=1.0,
-        beta=0.0,
-        gamma=0.0,  # 设置为 0 等价于关闭 length norm
-        remove_unused_columns=False,  # 保留 loss_mask / trajectory_labels 等自定义键
-        max_length=None,  # 你已预处理，就别再让 SFTTrainer truncate
-        dataset_kwargs={"skip_prepare_dataset": True}  # 跳过内部 prepare_dataset / map 流程
+        remove_unused_columns=False,
+        eval_steps=200,
+        load_best_model_at_end=True,
+        eval_strategy='steps',
+        metric_for_best_model="f1",
+        greater_is_better=True,
+        seed=42,
+        report_to='swanlab',   # 你要接 SwanLab/W&B 再改
+        # ✅ 关键：lr 降到 1e-6 / 3e-6 这个级别
+        learning_rate=3e-6,
+        weight_decay=0.01,
+        warmup_ratio=0.1,
     )
 
-    # ------------ Trainer ------------
-    trainer = MarkerAnchoredPRMTrainer(
+    collator = DataCollatorForLastTokenClassification()
+
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        optimizers=(optimizer, scheduler),
-        data_collator=default_data_collator,  # 数据已经是 tensor + pad 好的，直接用默认 collator
+        eval_dataset=eval_dataset,
+        data_collator=collator,
+        tokenizer=tokenizer,
+        compute_metrics=compute_metrics,
     )
 
-    # ------------ Train ------------
     trainer.train()
 
-    # 保存最终模型（包括更新后的 PRM 头参数）
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
 
