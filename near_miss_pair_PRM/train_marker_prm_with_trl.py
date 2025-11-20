@@ -1,9 +1,11 @@
 import os
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 import numpy as np
 import torch
 from torch.utils.data import Subset
+import torch.distributed as dist
+from datetime import timedelta
 
 from transformers import (
     AutoTokenizer,
@@ -14,21 +16,27 @@ from transformers import (
 
 from verl.utils.dataset.marker_anchored_multiturn_sft_dataset import MarkerAnchoredMultiTurnSFTDataset
 from accelerate import Accelerator
+from transformers import get_cosine_schedule_with_warmup
+from torch.optim import AdamW
+import torch.nn.functional as F
+
 accelerator = Accelerator(mixed_precision='bf16')
 
 # 只在主进程做一次副作用操作（登录/初始化/创建目录/写配置等）
 if accelerator.is_main_process:
     os.environ["SWANLAB_API_KEY"] = "WoZrF9qolYJjzYBCfArih"     # <<< 填你的 key
-
+# if os.getenv('PYCHARM_HOSTED') != '1':
+#     dist.init_process_group(backend='nccl', timeout=timedelta(hours=6))
 
 
 # ============ 只在最后一个非 PAD 位置打 label 的 collator ============
-class DataCollatorForLastTokenClassification:
+class DataCollatorForTokenClassification:
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         # 明确只取这几个 key，避免各种奇怪类型
         input_ids_list = [f["input_ids"] for f in features]
         attention_mask_list = [f["attention_mask"] for f in features]
         traj_label_list = [f["trajectory_labels"] for f in features]
+        loss_mask_list = [f["loss_mask"] for f in features]   # ✅ 新增
 
         # input_ids / attention_mask 一般已经是 tensor，直接 stack
         input_ids = torch.stack(input_ids_list)           # (B, L)
@@ -39,6 +47,12 @@ class DataCollatorForLastTokenClassification:
             traj_labels = torch.stack(traj_label_list).view(-1).long()
         else:
             traj_labels = torch.tensor(traj_label_list, dtype=torch.long)
+
+        # loss_mask 可能是 list[int] / list[float] / tensor，统一成 (B, L) float
+        if isinstance(loss_mask_list[0], torch.Tensor):
+            loss_mask = torch.stack(loss_mask_list).float()
+        else:
+            loss_mask = torch.tensor(loss_mask_list, dtype=torch.float32)  # (B, L)
 
         B, L = input_ids.shape
         labels = torch.full((B, L), fill_value=-100, dtype=torch.long)
@@ -54,32 +68,119 @@ class DataCollatorForLastTokenClassification:
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "labels": labels,
+            "labels": labels,  # HF 默认用这个当 label_ids
+            "loss_mask": loss_mask,  # ✅ 我们自定义 loss 用
+            "trajectory_labels": traj_labels,  # ✅ 每个样本一个 label
         }
+
+
+
+class MarkerPRMTrainer(Trainer):
+    def _aggregate_logits_and_labels(
+            self,
+            outputs,
+            loss_mask: torch.Tensor,
+            traj_labels: torch.Tensor,
+    ):
+        """
+        outputs.logits: (B, L, C)
+        loss_mask:     (B, L)
+        traj_labels:   (B,)
+        -> agg_logits: (B, C), traj_labels: (B,)
+        """
+        logits = outputs.logits.float()  # (B, L, C)
+        loss_mask = loss_mask.to(logits.device)  # (B, L)
+        loss_mask = loss_mask.unsqueeze(-1)  # (B, L, 1)
+
+        agg_logits = (logits * loss_mask).sum(dim=1)  # (B, C)
+        traj_labels = traj_labels.to(logits.device).long()  # (B,)
+
+        return agg_logits, traj_labels
+
+    def compute_loss(
+            self,
+            model,
+            inputs,
+            return_outputs: bool = False,
+            num_items_in_batch: int | None = None,
+    ):
+        # 取出我们自己的监督信号
+        traj_labels = inputs.pop("trajectory_labels")  # (B,)
+        loss_mask = inputs.pop("loss_mask")  # (B, L)
+        # 不需要默认的 token-level loss，去掉 labels，防止模型多算一次
+        inputs.pop("labels", None)
+
+        outputs = model(**inputs)
+        agg_logits, traj_labels = self._aggregate_logits_and_labels(
+            outputs, loss_mask, traj_labels
+        )
+
+        loss = F.cross_entropy(agg_logits, traj_labels)
+
+        return (loss, outputs) if return_outputs else loss
+
+    def prediction_step(
+            self,
+            model,
+            inputs,
+            prediction_loss_only: bool,
+            ignore_keys: Optional[List[str]] = None,
+    ):
+        """
+        让 eval/predict 阶段返回：
+        - loss: aggregated PRM loss
+        - logits: agg_logits (B, 2)
+        - labels: traj_labels (B,)
+        这样 compute_metrics 就是纯 PRM 语义了。
+        """
+        # 拿出我们自己的 label & mask
+        traj_labels = inputs.pop("trajectory_labels")  # (B,)
+        loss_mask = inputs.pop("loss_mask")  # (B, L)
+        # 同样去掉 token-level labels，避免多算
+        inputs.pop("labels", None)
+
+        # HF 的标准预处理（放到正确 device，上 fp16/bf16 等）
+        inputs = self._prepare_inputs(inputs)
+
+        has_labels = traj_labels is not None
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+            agg_logits, traj_labels = self._aggregate_logits_and_labels(
+                outputs, loss_mask, traj_labels
+            )
+
+            loss = None
+            if has_labels:
+                loss = F.cross_entropy(agg_logits, traj_labels)
+
+        if prediction_loss_only:
+            return (loss, None, None)
+
+        # 注意这里返回的是：
+        # logits = (B, 2)，labels = (B,)
+        return (loss, agg_logits, traj_labels)
 
 
 # ==================== 评估指标 ====================
 def compute_metrics(eval_pred):
     """
-    eval_pred.predictions: (B, L, C)  token 分类 logits
-    eval_pred.label_ids:  (B, L)      只有一个位置是 0/1，其余为 -100
+    eval_pred.predictions: (N, 2)  —— aggregated logits
+    eval_pred.label_ids:  (N,)     —— trajectory_labels (0/1)
     """
-    logits = eval_pred.predictions          # np.ndarray, (B, L, C)
-    labels = eval_pred.label_ids            # np.ndarray, (B, L)
+    logits = eval_pred.predictions      # (N, 2)
+    labels = eval_pred.label_ids        # (N,)
 
-    pred_ids = logits.argmax(-1)            # (B, L)
+    # 有些版本会给 (N, 1)，保险起见 squeeze 一下
+    labels = np.asarray(labels).astype(np.int64).reshape(-1)
+    preds = logits.argmax(-1).astype(np.int64).reshape(-1)
 
-    mask = labels != -100                   # (B, L)
-    if mask.sum() == 0:
-        return {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
+    assert preds.shape == labels.shape
 
-    y_true = labels[mask].astype(np.int64)  # (N,)
-    y_pred = pred_ids[mask].astype(np.int64)
-
-    tp = int(((y_pred == 1) & (y_true == 1)).sum())
-    tn = int(((y_pred == 0) & (y_true == 0)).sum())
-    fp = int(((y_pred == 1) & (y_true == 0)).sum())
-    fn = int(((y_pred == 0) & (y_true == 1)).sum())
+    tp = int(((preds == 1) & (labels == 1)).sum())
+    tn = int(((preds == 0) & (labels == 0)).sum())
+    fp = int(((preds == 1) & (labels == 0)).sum())
+    fn = int(((preds == 0) & (labels == 1)).sum())
 
     def safe_div(n, d):
         return float(n) / float(d) if d != 0 else 0.0
@@ -98,9 +199,9 @@ def compute_metrics(eval_pred):
 
 
 def main():
-    prefix = '/home/test/test12'
+    prefix = '/workspace'
 
-    model_name = prefix + "/models/Qwen/Qwen2.5-7B-Instruct"
+    model_name = prefix + "/models/Qwen/Qwen2.5-1.5B-Instruct"
     output_dir = prefix + "/fanshengda/verl/prm_ckpts_last_token_ce"
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -116,6 +217,14 @@ def main():
         attn_implementation="flash_attention_2",
     )
     model.gradient_checkpointing_enable()
+
+    # ✅ 1. 增加新 token
+    new_tokens = ["<extra_0>"]
+    added = tokenizer.add_tokens(new_tokens)
+    print(f"Added {added} new tokens")
+
+    # ✅ 2. 同步模型 embedding
+    model.resize_token_embeddings(len(tokenizer))
 
     parquet_paths = [
         prefix + "/fanshengda/verl/input_data/near_miss_prm/anchor_train_1116.parquet"
@@ -139,9 +248,8 @@ def main():
 
 
     sample = full_dataset[0]
-    print('dada')
     assert "trajectory_labels" in sample, "dataset 需要提供 trajectory_labels (0/1)!"
-
+    assert 'loss_mask' in sample, "dataset 需要提供 loss_mask (0/1)!"
     # ============ 95% 训练 / 5% 验证 ============
     N = len(full_dataset)
     rng = np.random.default_rng(seed=42)
@@ -155,11 +263,40 @@ def main():
     train_dataset = Subset(full_dataset, train_indices)
     eval_dataset  = Subset(full_dataset, eval_indices)
 
+    per_device_train_batch_size = 1
+    num_train_epochs = 3
+    gradient_accumulation_steps = 2
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    steps_per_epoch = len(train_dataset) // (per_device_train_batch_size * world_size)
+    total_training_steps = (steps_per_epoch * num_train_epochs) // gradient_accumulation_steps
+    # 区分 backbone 和新 PRM 头
+    base_params, head_params = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "score" in name:  # Qwen2ForProcessRewardModel.score 的 MLP 头
+            head_params.append(param)
+        else:
+            base_params.append(param)
+    optimizer = AdamW(
+        [
+            {"params": base_params, "lr": 3e-6, "weight_decay": 0.01},  # backbone 小一点
+            {"params": head_params, "lr": 1e-5, "weight_decay": 0.01},  # 新头大一点
+        ]
+    )
+
+    # optimizer = AdamW(model.parameters(), lr=learning_rate)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=int(total_training_steps * 0.1),
+        num_training_steps=total_training_steps,
+    )
+
     training_args = TrainingArguments(
         output_dir=output_dir,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=2,
-        num_train_epochs=3,
+        per_device_train_batch_size=per_device_train_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        num_train_epochs=num_train_epochs,
         logging_steps=1,
         save_steps=200,
         save_total_limit=3,
@@ -174,21 +311,18 @@ def main():
         greater_is_better=True,
         seed=42,
         report_to='swanlab',   # 你要接 SwanLab/W&B 再改
-        # ✅ 关键：lr 降到 1e-6 / 3e-6 这个级别
-        learning_rate=3e-6,
-        weight_decay=0.01,
-        warmup_ratio=0.1,
     )
 
-    collator = DataCollatorForLastTokenClassification()
+    collator = DataCollatorForTokenClassification()
 
-    trainer = Trainer(
+    trainer = MarkerPRMTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=collator,
         tokenizer=tokenizer,
+        optimizers=(optimizer, scheduler),
         compute_metrics=compute_metrics,
     )
 
