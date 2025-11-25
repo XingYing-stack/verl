@@ -17,7 +17,9 @@ from datetime import datetime
 from pprint import pprint
 from typing import Any
 
+import numpy as np
 import ray
+import torch
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
@@ -147,16 +149,16 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         queue_len = 0
         while len(queue_samples) < self.required_samples:
             # Get a single sample and wait until there is a sample or None is received
-            sample, queue_len = self.message_queue_client.get_sample_sync()
+            sample_blob, queue_len = self.message_queue_client.get_sample_sync()
 
-            if sample is None:
+            if sample_blob is None:
                 print(
                     f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
                     f"Collected {len(queue_samples)}/{self.required_samples} samples"
                 )
                 break
 
-            queue_samples.append(sample)
+            queue_samples.append(sample_blob)
 
             if len(queue_samples) % 64 == 0:
                 print(
@@ -186,6 +188,56 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
         batch.meta_info["fully_async/total_wait_time"] = total_wait_time
         return 0, batch
+
+    def _apply_filter_mask(self, batch, metrics) -> tuple[Any | None, int, int]:
+        """Zero out response masks for invalid rows instead of dropping them."""
+        filter_mask = batch.non_tensor_batch.get("filter_passed")
+        if filter_mask is None:
+            return batch, len(batch), 0
+
+        mask_np = np.asarray(filter_mask, dtype=bool)
+        valid_rows = int(mask_np.sum())
+        dropped = len(mask_np) - valid_rows
+        if valid_rows == 0:
+            metrics["fully_async/filter/dropped_rows"] = dropped
+            print("[FullyAsyncTrainer] All rows flagged invalid; skipping batch")
+            return None, 0, dropped
+
+        metrics["fully_async/filter/dropped_rows"] = dropped
+        metrics["fully_async/filter/valid_rows"] = valid_rows
+
+        if "response_mask" in batch.batch:
+            ref_tensor = batch.batch["response_mask"]
+        else:
+            ref_tensor = next(iter(batch.batch.values()))
+        mask_tensor = torch.from_numpy(mask_np.astype(np.float32)).to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+        mask_tensor = mask_tensor.unsqueeze(-1)
+
+        if "response_mask" in batch.batch:
+            batch.batch["response_mask"] = batch.batch["response_mask"] * mask_tensor
+
+        batch.meta_info["filter_passed_mask"] = mask_np.tolist()
+        if "global_token_num" in batch.meta_info:
+            batch.meta_info["global_token_num"] = [
+                value if keep else 0 for value, keep in zip(batch.meta_info["global_token_num"], mask_np, strict=False)
+            ]
+
+        return batch, valid_rows, dropped
+
+    def _mask_post_process_tensors(self, batch):
+        filter_mask = batch.meta_info.get("filter_passed_mask")
+        if not filter_mask:
+            return
+        mask_np = np.asarray(filter_mask, dtype=bool)
+        if "response_mask" in batch.batch:
+            ref_tensor = batch.batch["response_mask"]
+        else:
+            ref_tensor = next(iter(batch.batch.values()))
+        mask_tensor = torch.from_numpy(mask_np.astype(np.float32)).to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+        mask_tensor = mask_tensor.unsqueeze(-1)
+        for key in ["token_level_scores", "token_level_rewards"]:
+            if key in batch.batch:
+                batch.batch[key] = batch.batch[key] * mask_tensor
 
     def _create_actor_rollout_classes(self):
         # create actor
@@ -250,28 +302,43 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 self.logger.log(data=val_data.metrics, step=val_data.param_version)
                 pprint(f"[FullyAsyncTrainer] Initial validation metrics: {val_data.metrics}")
             self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
+        else:
+            print("[FullyAsyncTrainer] No initial validation data from MQ.")
 
         # Use queue mode, no need for traditional dataloader iterator
         # Initialize to get the first batch of data
         while True:
             metrics = {}
             timing_raw = {}
+            current_valid_rows = self.required_samples
 
             with marked_timer("step", timing_raw):
                 with marked_timer("gen", timing_raw, color="red"):
                     epoch, batch = self._get_samples_from_queue()
                     if batch is None:
                         break
+                    batch, valid_rows, dropped_rows = self._apply_filter_mask(batch, metrics)
+                    if batch is None:
+                        print("[FullyAsyncTrainer] All rows filtered out, skipping step")
+                        continue
+                    current_valid_rows = valid_rows
+                    if dropped_rows:
+                        print(
+                            f"[FullyAsyncTrainer] Masked {dropped_rows} filtered rows "
+                            f"before training step"
+                        )
                     self._collect_metrics_from_samples(batch, metrics)
                 batch, reward_extra_infos_dict = self._process_batch_common(
                     batch, metrics, timing_raw, self.local_trigger_step if self.compute_prox_log_prob else None
                 )
+                self._mask_post_process_tensors(batch)
                 self._log_rollout(batch, reward_extra_infos_dict, timing_raw)
                 self._check_save_checkpoint(False, timing_raw)
 
             self._collect_metrics(batch, 0, metrics, timing_raw)
+            sample_count = current_valid_rows
             self.metrics_aggregator.add_step_metrics(
-                metrics=metrics, sample_count=self.required_samples, timestamp=time.time()
+                metrics=metrics, sample_count=sample_count, timestamp=time.time()
             )
             # Trigger parameter synchronization after training step
             time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -292,6 +359,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                         Validation metrics: {val_data.metrics}"
                     )
                 self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
+            else:
+                print("[FullyAsyncTrainer] No validation data available after param sync.")
             self.global_steps += 1
 
         # final parameter sync and validate
@@ -305,6 +374,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     self.logger.log(data=val_data.metrics, step=val_data.param_version)
                     pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
                 self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
+            else:
+                print("[FullyAsyncTrainer] No final validation data from MQ.")
         else:
             pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
         self.progress_bar.close()

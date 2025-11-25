@@ -78,22 +78,34 @@ class ParameterSynchronizer:
         start_time = time.time()
 
         self.current_version = version
-        print(f"[ParameterSynchronizer] Starting weight synchronization (version {self.current_version})...")
+        print(
+            f"[ParameterSynchronizer] Starting weight synchronization (version {self.current_version})..."
+        )
 
+        print("[ParameterSynchronizer] -> pause rollouter")
         ray.get(self.rollouter.pause.remote())
-        
-        print(f"[ParameterSynchronizer] rollout paused. cost {time.time() - start_time:.2f} seconds")
+        print(
+            f"[ParameterSynchronizer] <- paused (elapsed {time.time() - start_time:.2f}s)"
+        )
         # Update MQ version
+        print("[ParameterSynchronizer] -> update MQ param version")
         self.mq_client.update_param_version_sync(version)
+        print("[ParameterSynchronizer] <- MQ param version updated")
 
         # sync weights
+        print("[ParameterSynchronizer] -> sync actor->rollout weights (actor_wg)")
         self.actor_wg.sync_rollout_weights()
+        print("[ParameterSynchronizer] -> sync actor->rollout weights (rollout_wg)")
         ray.get(self.rollout_wg.sync_rollout_weights())
         end_time = time.time()
         print(f"[ParameterSynchronizer] sync_weights success. cost {end_time - start_time:.2f} seconds")
 
         # Async Update rollout version & validation
+        print(
+            f"[ParameterSynchronizer] -> rollouter.update_param_version(version={version}, validate={validate}, global_steps={global_steps})"
+        )
         self.wait_last_update = self.rollouter.update_param_version.remote(version, validate, global_steps)
+        print("[ParameterSynchronizer] -> rollouter.resume(wait_last_update)")
         self.wait_last_resume = self.rollouter.resume.remote(self.wait_last_update)
 
     def wait_last_valid(self):

@@ -1,3 +1,4 @@
+# accelerate launch --config_file /home/test/test12/.cache/huggingface/accelerate/fsd_trl_sft.yaml near_miss_pair_PRM/train_marker_prm_with_trl.py
 import os
 from typing import Dict, Any, List, Optional
 
@@ -25,8 +26,6 @@ accelerator = Accelerator(mixed_precision='bf16')
 # 只在主进程做一次副作用操作（登录/初始化/创建目录/写配置等）
 if accelerator.is_main_process:
     os.environ["SWANLAB_API_KEY"] = "WoZrF9qolYJjzYBCfArih"     # <<< 填你的 key
-# if os.getenv('PYCHARM_HOSTED') != '1':
-#     dist.init_process_group(backend='nccl', timeout=timedelta(hours=6))
 
 
 # ============ 只在最后一个非 PAD 位置打 label 的 collator ============
@@ -76,6 +75,45 @@ class DataCollatorForTokenClassification:
 
 
 class MarkerPRMTrainer(Trainer):
+    # def _aggregate_logits_and_labels(
+    #         self,
+    #         outputs,
+    #         loss_mask: torch.Tensor,
+    #         traj_labels: torch.Tensor,
+    # ):
+    #     """
+    #     outputs.logits: (B, L, C)
+    #     loss_mask:     (B, L)   —— marker 位置为 1，其余为 0
+    #     traj_labels:   (B,)
+    #     -> agg_logits: (B, C), traj_labels: (B,)
+    #     """
+    #     logits = outputs.logits.float()              # (B, L, C)
+    #     loss_mask = loss_mask.to(logits.device)      # (B, L)
+    #
+    #     B, L, C = logits.shape
+    #
+    #     # 1. 找出每个样本最后一个 loss_mask == 1 的位置
+    #     mask_bool = loss_mask > 0                   # (B, L) bool
+    #     # 如果你确信每个样本至少一个 marker，可以直接 assert
+    #     assert mask_bool.any(dim=1).all(), "some samples have no marker (loss_mask 全 0)"
+    #
+    #     # 位置索引 [0, 1, 2, ..., L-1]
+    #     positions = torch.arange(L, device=logits.device).unsqueeze(0).expand(B, L)
+    #     # 非 marker 位置设为 -1，这样 max 就会选到最后一个 True 的那个 index
+    #     positions = positions.masked_fill(~mask_bool, -1)
+    #     last_idx = positions.max(dim=1).values      # (B,)
+    #
+    #     # 2. 取出每个样本最后一个 marker 对应的 logits: (B, C)
+    #     batch_idx = torch.arange(B, device=logits.device)
+    #     agg_logits = logits[batch_idx, last_idx]    # (B, C)
+    #
+    #     # 3. labels 搬到同一设备
+    #     traj_labels = traj_labels.to(logits.device).long()  # (B,)
+    #
+    #     return agg_logits, traj_labels
+
+
+    # 能不能也学一个重要性呢？直接加权和，学一个重要重要程度？
     def _aggregate_logits_and_labels(
             self,
             outputs,
@@ -199,10 +237,9 @@ def compute_metrics(eval_pred):
 
 
 def main():
-    prefix = '/workspace'
-
-    model_name = prefix + "/models/Qwen/Qwen2.5-1.5B-Instruct"
-    output_dir = prefix + "/fanshengda/verl/prm_ckpts_last_token_ce"
+    prefix = '/home/test/test12'
+    model_name = prefix + "/models/Qwen/Qwen2.5-7B-Instruct"
+    output_dir = prefix + "/fanshengda/verl/prm_ckpts/last_token_ce"
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -263,40 +300,11 @@ def main():
     train_dataset = Subset(full_dataset, train_indices)
     eval_dataset  = Subset(full_dataset, eval_indices)
 
-    per_device_train_batch_size = 1
-    num_train_epochs = 3
-    gradient_accumulation_steps = 2
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    steps_per_epoch = len(train_dataset) // (per_device_train_batch_size * world_size)
-    total_training_steps = (steps_per_epoch * num_train_epochs) // gradient_accumulation_steps
-    # 区分 backbone 和新 PRM 头
-    base_params, head_params = [], []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if "score" in name:  # Qwen2ForProcessRewardModel.score 的 MLP 头
-            head_params.append(param)
-        else:
-            base_params.append(param)
-    optimizer = AdamW(
-        [
-            {"params": base_params, "lr": 3e-6, "weight_decay": 0.01},  # backbone 小一点
-            {"params": head_params, "lr": 1e-5, "weight_decay": 0.01},  # 新头大一点
-        ]
-    )
-
-    # optimizer = AdamW(model.parameters(), lr=learning_rate)
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer=optimizer,
-        num_warmup_steps=int(total_training_steps * 0.1),
-        num_training_steps=total_training_steps,
-    )
-
     training_args = TrainingArguments(
         output_dir=output_dir,
-        per_device_train_batch_size=per_device_train_batch_size,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        num_train_epochs=num_train_epochs,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=2,
+        num_train_epochs=3,
         logging_steps=1,
         save_steps=200,
         save_total_limit=3,
@@ -311,6 +319,10 @@ def main():
         greater_is_better=True,
         seed=42,
         report_to='swanlab',   # 你要接 SwanLab/W&B 再改
+        # ✅ 关键：lr 降到 1e-6 / 3e-6 这个级别
+        learning_rate=3e-6,
+        weight_decay=0.01,
+        warmup_ratio=0.03,
     )
 
     collator = DataCollatorForTokenClassification()
@@ -322,7 +334,6 @@ def main():
         eval_dataset=eval_dataset,
         data_collator=collator,
         tokenizer=tokenizer,
-        optimizers=(optimizer, scheduler),
         compute_metrics=compute_metrics,
     )
 

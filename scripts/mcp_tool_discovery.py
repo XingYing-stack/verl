@@ -25,7 +25,7 @@ async def fetch_json(client: httpx.AsyncClient, url: str) -> Any:
 
 
 async def main():
-    manager_url = "http://101.6.41.97:18080/container/21ee0059c73a/mcpapi"
+    manager_url = "http://100.126.79.1:8080/container/fc92e54d9b33/mcpapi"
 
     servers: Dict[str, Dict] = {}
     tools_by_server: Dict[str, List[Dict]] = {}

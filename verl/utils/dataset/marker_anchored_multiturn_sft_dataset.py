@@ -83,7 +83,7 @@ class MarkerAnchoredMultiTurnSFTDataset(MultiTurnSFTDataset):
         
         
         self._trajectory_labels = [{'positive':1, 'negative':0}[sample['ground_truth']] for sample in self.dataframe['reward_model'].tolist()]
-
+        print('len(self._trajectory_labels):', self._trajectory_labels)
         self._marker_token_ids = marker_token_ids
 
 
@@ -255,7 +255,6 @@ class MarkerAnchoredMultiTurnSFTDataset(MultiTurnSFTDataset):
             and start_idx == len(messages) - 1
             and self._marker_token_ids
         ):
-        #
         # if (
         #     self._marker_enabled
         #     and start_idx == len(messages) - 1

@@ -15,6 +15,7 @@ import asyncio
 import time
 from pprint import pformat
 
+import numpy as np
 import ray
 from ray import ObjectRef
 
@@ -154,6 +155,21 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.result_queue = asyncio.Queue()
         self.cancel_queue = asyncio.Queue()
 
+    def _attach_task_logger(self, task: asyncio.Task, name: str):
+        """Attach completion logging to asyncio tasks for easier debugging"""
+
+        def _log_result(done_task: asyncio.Task):
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                print(f"[FullyAsyncRollouter][TaskLogger] {name} task cancelled")
+            except Exception as exc:  # pragma: no cover - diagnostic path
+                print(f"[FullyAsyncRollouter][TaskLogger] {name} task exception: {exc!r}")
+            else:
+                print(f"[FullyAsyncRollouter][TaskLogger] {name} task exited normally")
+
+        task.add_done_callback(_log_result)
+
     async def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""
         async with self.lock:
@@ -196,6 +212,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
     async def update_param_version(self, version: int, validate: bool = False, global_steps: int = 0):
         """Update current parameter version"""
+        print(
+            f"[FullyAsyncRollouter][Public][update_param_version] ENTER version={version}, validate={validate}, global_steps={global_steps}"
+        )
         async with self.lock:
             old_version = self.current_param_version
             self.current_param_version = version
@@ -229,14 +248,29 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 and self.current_param_version % self.config.rollout.test_freq == 0
                 and self.current_param_version > 0  # don't test here in the initial parameter sync
             ) or (validate and self.val_reward_fn is not None):
+                print(
+                    f"[FullyAsyncRollouter][Public][update_param_version] start _validate() at version={self.current_param_version}"
+                )
                 with marked_timer("rollouter/validate_time", timing_raw, color="green"):
-                    val_metrics: dict = self._validate()
+                    val_metrics = self._validate()
+                print(
+                    f"[FullyAsyncRollouter][Public][update_param_version] end _validate(), has_metrics={bool(val_metrics)}"
+                )
             data = ValidateMetrics(
                 timing_raw=timing_raw, metrics=val_metrics, global_steps=global_steps, param_version=version
             )
+            print(
+                f"[FullyAsyncRollouter][Public][update_param_version] -> MQ.put_validate(version={version})"
+            )
             await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
+            print(
+                f"[FullyAsyncRollouter][Public][update_param_version] <- MQ.put_validate done (version={version})"
+            )
 
             self.version_start_time = time.time()
+        print(
+            f"[FullyAsyncRollouter][Public][update_param_version] EXIT version={version}, validate={validate}"
+        )
 
     def _validate_config(self):
         # Validate asynchronous training configuration
@@ -416,8 +450,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
         # Calling asynchronous generation methods
-        rollout_sample.full_batch.non_tensor_batch["param_version"] = [self.current_param_version] * len(
-            rollout_sample.full_batch
+        rollout_sample.full_batch.non_tensor_batch["param_version"] = np.full(
+            len(rollout_sample.full_batch), self.current_param_version, dtype=np.int64
         )
         rollout_sample.agent_loop_output_list = await self.async_rollout_manager.generate_single_sample_async(
             rollout_sample.full_batch, rollout_sample.agent_loop_output_list
@@ -443,21 +477,39 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         The consumer coroutine is responsible for obtaining the processing results
         from the result queue and putting them into the message queue
         """
-        while True:
-            rollout_sample = await self.result_queue.get()
-            rollout_sample = merge_rollout_sample(self.config, self.tokenizer, rollout_sample, self.processor)
+        try:
+            while True:
+                rollout_sample = await self.result_queue.get()
+                rollout_sample = merge_rollout_sample(self.config, self.tokenizer, rollout_sample, self.processor)
+                sample_id = getattr(rollout_sample, "sample_id", "NA")
+                print(
+                    "[FullyAsyncRollouter][Consumer] Dequeued sample",
+                    sample_id,
+                    f"result_queue_size={self.result_queue.qsize()}",
+                    f"staleness={self.staleness_samples}",
+                    f"active_tasks={len(self.active_tasks)}",
+                )
 
-            # Put RolloutSample into the message queue
-            success = await self.message_queue_client.put_sample(
-                sample=ray.cloudpickle.dumps(rollout_sample),
-                param_version=rollout_sample.param_version,
-            )
-            if success:
-                self.total_generated_samples += 1
-            else:
-                self.dropped_stale_samples += 1
+                # Put RolloutSample into the message queue
+                success = await self.message_queue_client.put_sample(
+                    sample=ray.cloudpickle.dumps(rollout_sample),
+                    param_version=rollout_sample.param_version,
+                )
+                if success:
+                    self.total_generated_samples += 1
+                    print(
+                        "[FullyAsyncRollouter][Consumer] Put sample",
+                        sample_id,
+                        f"mq_queue_size={self.message_queue_client.get_statistics_sync()['queue_size']}",
+                        f"total_generated={self.total_generated_samples}",
+                    )
+                else:
+                    self.dropped_stale_samples += 1
 
-            self.result_queue.task_done()
+                self.result_queue.task_done()
+        except Exception as exc:
+            print(f"[FullyAsyncRollouter][Consumer] Exception: {exc!r}")
+            raise
 
     async def _streaming_generation_main(self):
         """The main entry method for stream processing"""
@@ -475,6 +527,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.feed_task = asyncio.create_task(self._feed_samples())
         self.processor_task = asyncio.create_task(self._processor_worker())
         self.consumer_task = asyncio.create_task(self._consumer_worker())
+        self._attach_task_logger(self.feed_task, "feed")
+        self._attach_task_logger(self.processor_task, "processor")
+        self._attach_task_logger(self.consumer_task, "consumer")
 
         try:
             # Wait for sample feed to complete
@@ -556,23 +611,26 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         check_interval = 10.0
 
         while True:
-            async with self.lock:
-                if not self.running:
-                    break
-            await asyncio.sleep(check_interval)
-            # Print statistics periodically
-            current_time = time.time()
-            if current_time - last_stats_time >= stats_interval:
-                stats = await self.get_statistics()
-                print(f"[FullyAsyncRollouter][MonitorLoop][Statistics] {pformat(stats)}")
-                last_stats_time = current_time
-
-            # Trigger rollout recovery
-            if self.monitor_loop_trigger:
-                if not await self._should_pause_generation():
-                    async with self.lock:
-                        self.paused = False
-                        self.condition.notify_all()
+            try:
+                async with self.lock:
+                    if not self.running:
+                        break
+                await asyncio.sleep(check_interval)
+                # Print statistics periodically
+                current_time = time.time()
+                if current_time - last_stats_time >= stats_interval:
+                    stats = await self.get_statistics()
+                    print(f"[FullyAsyncRollouter][MonitorLoop][Statistics] {pformat(stats)}")
+                    last_stats_time = current_time
+    
+                # Trigger rollout recovery
+                if self.monitor_loop_trigger:
+                    if not await self._should_pause_generation():
+                        async with self.lock:
+                            self.paused = False
+                            self.condition.notify_all()
+            except Exception as exc:
+                print(f"[FullyAsyncRollouter][MonitorLoop] Exception: {exc}")
 
     async def _should_pause_generation(self) -> bool:
         """Determine whether the build should be paused"""

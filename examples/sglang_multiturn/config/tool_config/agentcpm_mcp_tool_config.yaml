@@ -10,10 +10,11 @@ tools:
         enable: true
         tool_names: ["fetch_url", "visit", "browser_get_page_info", "browser_get_markdown"]
         browser_agent_url: "http://localhost:28888/v1"
-        browser_agent_key: ""
+        browser_agent_key: "dada"
         browser_agent_model_name: "qwen3-4b-instruct-2507"
         # Optional override for browser agent request total timeout (seconds)
-        timeout: 300
+        timeout: 600
         max_completion_tokens: 8000
+        max_concurrency: 16
     mcp:
       mcp_servers_config_path: ./examples/sglang_multiturn/config/tool_config/agentcpm_mcp_server.json

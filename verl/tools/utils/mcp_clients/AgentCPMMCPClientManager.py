@@ -70,6 +70,7 @@ class MCPManager:
         self.browser_agent_enabled: bool = bool(ba.get("enable", False))
         self.browser_agent_tool_names: List[str] = list(ba.get("tool_names", []))
         self.browser_agent_url: Optional[str] = ba.get("browser_agent_url")
+        self.browser_agent_sema = asyncio.Semaphore(ba.get("max_concurrency", 16))
         try:
             self.browser_agent_timeout: Optional[float] = float(ba.get("timeout")) if ba.get("timeout") is not None else None
         except Exception:
@@ -252,12 +253,13 @@ class MCPManager:
 
                         # ====================如启用浏览器处理器，并且命中工具名单，则尝试调用外部 LLM 生成摘要==========================
                         if self.browser_agent_enabled and self._should_process_with_browser_agent(tool_name):
-                            try:
-                                processed_text = await self._maybe_process_with_browser_agent(tool_name, parameters, data)
-                                if isinstance(processed_text, str) and processed_text.strip():
-                                    text = processed_text
-                            except Exception as proc_exc:
-                                logger.warning(f"Browser agent processing failed: {proc_exc}")
+                            async with self.browser_agent_sema:
+                                try:
+                                    processed_text = await self._maybe_process_with_browser_agent(tool_name, parameters, data)
+                                    if isinstance(processed_text, str) and processed_text.strip():
+                                        text = processed_text
+                                except Exception as proc_exc:
+                                    logger.warning(f"Browser agent processing failed: {proc_exc}")
                         # ==============================================================================
                         return _CallResult(status=status, text=text, raw=data)
 
@@ -443,31 +445,21 @@ Please process the following webpage or local file content and user goal to extr
                 client = OpenAI(api_key=self.browser_agent_key, base_url=self.browser_agent_url)
                 # 将同步 SDK 调用放到线程池，外层用 wait_for 做总超时
                 def _invoke():
-                    resp = client.chat.completions.create(
-                        model=self.browser_agent_model_name,
-                        messages=messages,
-                        temperature=0.0,
-                        top_p=1.0,
-                        n=1,
-                        frequency_penalty=0.0,
-                        presence_penalty=0.0,
-                        logit_bias={},
-                        max_completion_tokens=self.max_completion_tokens
-                    )
                     try:
-                        if resp and resp.choices and resp.choices[0].message.content:
-                            return resp.choices[0].message.content
-                        if resp and resp.choices and getattr(resp.choices[0].message, "reasoning_content", None):
-                            return resp.choices[0].message.reasoning_content  # type: ignore[attr-defined]
-                        # OpenAI>=1.0 返回对象：choices[0].message.content
-                        return ""
-                    except Exception:
-                        # 退化处理为 dict 访问
-                        try:
-                            d = resp if isinstance(resp, dict) else resp.model_dump()  # type: ignore[attr-defined]
-                            return d.get("choices", [{}])[0].get("message", {}).get("content", "")
-                        except Exception:
-                            return ""
+                        resp = client.chat.completions.create(
+                            model=self.browser_agent_model_name,
+                            messages=messages,
+                            temperature=0.0,
+                            top_p=1.0,
+                            n=1,
+                            frequency_penalty=0.0,
+                            presence_penalty=0.0,
+                            logit_bias={},
+                            max_completion_tokens=self.max_completion_tokens
+                        )
+                        return resp.choices[0].message.content
+                    except Exception as e:
+                        logger.warning(f"Failed to get completion for agent {self.browser_agent_model_name}: {e}")
 
                 result: str = await asyncio.wait_for(asyncio.to_thread(_invoke), timeout=effective_timeout)
                 if isinstance(result, str) and result.strip():

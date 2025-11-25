@@ -58,7 +58,7 @@ yishan_correct_paths = [
   '/workspace/fanshengda/AgentCPM-MCP/sft_data/tongyi-ds-1114-correct-deepdive_qa_rl_all_messages.json',
   '/workspace/fanshengda/AgentCPM-MCP/sft_data/tongyi-ds-1114-correct-webwalker_silver_13k_all_messages.json'
 ]
-paths = deepseek_paths
+paths = deepseek_paths + tongyi_ASearcher_paths + yishan_correct_paths
 
 print(json.dumps(paths))
 PY

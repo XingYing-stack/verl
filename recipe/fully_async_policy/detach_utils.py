@@ -263,10 +263,55 @@ def process_rollout_log_probs(data_proto: DataProto, rollout_log_probs: list[lis
     return rollout_log_probs_tensor
 
 
+def _filter_agent_loop_outputs(rs: RolloutSample, config, tokenizer) -> None:
+    """Filter agent outputs before sending to trainer and record simple metrics."""
+    final_answer_tag = ""
+    if hasattr(config, "async_training") and config.async_training is not None:
+        final_answer_tag = config.async_training.get("final_answer_tag", "")
+    max_len = config.actor_rollout_ref.rollout.response_length
+
+    filtered_outputs: list[AgentLoopOutput] = []
+    kept_indices: list[int] = []
+    keep_mask: list[bool] = []
+
+    for idx, agent_loop in enumerate(rs.agent_loop_output_list):
+        if agent_loop is None:
+            # 无法处理的条目直接丢弃
+            continue
+        keep = False
+        # 如果小于最大长度，纳入计算
+        if len(agent_loop.response_ids) < max_len:
+            keep = True
+        # 如果没有answer_tag, 即不进行过滤，等于max_len的也都放进来
+        elif not final_answer_tag:
+            keep = True
+        else:
+            decoded = tokenizer.decode(agent_loop.response_ids, skip_special_tokens=False)
+            keep = final_answer_tag in decoded
+
+        filtered_outputs.append(agent_loop)
+        kept_indices.append(idx)
+        keep_mask.append(keep)
+
+    valid_output_count = sum(keep_mask)
+    rs.rollout_status["filter/valid_output_count"] = valid_output_count
+    passed = valid_output_count > 1
+    rs.rollout_status["filter/passed"] = passed
+    rs.rollout_status["filter/mask"] = keep_mask
+
+    # Remove entries that never produced an AgentLoopOutput (kept_indices shorter).
+    if kept_indices and rs.full_batch is not None and len(kept_indices) != len(rs.full_batch):
+        rs.full_batch = rs.full_batch.select_idxs(kept_indices)
+
+    rs.agent_loop_output_list = filtered_outputs
+
+
 def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
     """
     Supplement and refine the RolloutSample object,
     """
+    _filter_agent_loop_outputs(rs, config, tokenizer)
+
     # Step 1: Create a DataProto from the AgentLoopOutput to generate the result
     gen_batch_output = postprocess_agent_loop_outputs(rs, tokenizer, config, processor)
 
@@ -278,6 +323,19 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
     for key, value in rs.full_batch.non_tensor_batch.items():
         gen_batch_output.non_tensor_batch[key] = value
     gen_batch_output.meta_info.update(rs.full_batch.meta_info)
+
+    # Attach rollout filter mask so trainer can mark rows later
+    filter_mask = rs.rollout_status.get("filter/mask")
+    if filter_mask is None:
+        gen_batch_output.non_tensor_batch["filter_passed"] = np.ones(len(gen_batch_output), dtype=bool)
+    else:
+        filter_mask_array = np.array(filter_mask, dtype=bool)
+        if len(filter_mask_array) != len(gen_batch_output):
+            raise ValueError(
+                "Length of filter mask does not match batch size: "
+                f"{len(filter_mask_array)} vs {len(gen_batch_output)}"
+            )
+        gen_batch_output.non_tensor_batch["filter_passed"] = filter_mask_array
 
     # Step 3, set full_batch
     rs.full_batch = gen_batch_output

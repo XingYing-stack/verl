@@ -442,7 +442,11 @@ class RayPPOTrainer:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
-        """Dump rollout/validation samples as JSONL."""
+        """Dump rollout/validation samples as JSONL (minimal change version).
+
+        Keep original behavior, but use a larger write buffer and fsync to
+        reduce半写风险。其余逻辑不变。
+        """
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
 
@@ -464,8 +468,13 @@ class RayPPOTrainer:
             entry = {k: v[i] for k, v in base_data.items()}
             lines.append(json.dumps(entry, ensure_ascii=False))
 
-        with open(filename, "w") as f:
+        with open(filename, "w", buffering=1024 * 1024) as f:
             f.write("\n".join(lines) + "\n")
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
 
         print(f"Dumped generations to {filename}")
 
@@ -875,8 +884,13 @@ class RayPPOTrainer:
             f.write(str(self.global_steps))
 
     def _load_checkpoint(self):
+        print(
+            f"[RayPPOTrainer][_load_checkpoint] resume_mode={self.config.trainer.resume_mode}, "
+            f"default_local_dir={self.config.trainer.default_local_dir}"
+        )
         if self.config.trainer.resume_mode == "disable":
             # NOTE: while there is no checkpoint to load, we still need to offload the model and optimizer to CPU
+            print("[RayPPOTrainer][_load_checkpoint] resume disabled; initializing from scratch")
             self.actor_rollout_wg.load_checkpoint(None)
             return 0
 
@@ -888,12 +902,14 @@ class RayPPOTrainer:
             if not os.path.isabs(checkpoint_folder):
                 working_dir = os.getcwd()
                 checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
+            print(f"[RayPPOTrainer][_load_checkpoint] search folder: {checkpoint_folder}")
             global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
+            print(f"[RayPPOTrainer][_load_checkpoint] latest checkpoint folder: {global_step_folder}")
 
         # find global_step_folder
         if self.config.trainer.resume_mode == "auto":
             if global_step_folder is None:
-                print("Training from scratch")
+                print("[RayPPOTrainer][_load_checkpoint] no checkpoint found; training from scratch")
                 self.actor_rollout_wg.load_checkpoint(None)
                 return 0
         else:
@@ -906,12 +922,12 @@ class RayPPOTrainer:
                 if not os.path.isabs(global_step_folder):
                     working_dir = os.getcwd()
                     global_step_folder = os.path.join(working_dir, global_step_folder)
-        print(f"Load from checkpoint folder: {global_step_folder}")
+        print(f"[RayPPOTrainer][_load_checkpoint] load from: {global_step_folder}")
         # set global step
         self.global_steps = int(global_step_folder.split("global_step_")[-1])
 
-        print(f"Setting global step to {self.global_steps}")
-        print(f"Resuming from {global_step_folder}")
+        print(f"[RayPPOTrainer][_load_checkpoint] set global_steps={self.global_steps}")
+        print(f"[RayPPOTrainer][_load_checkpoint] resuming from {global_step_folder}")
 
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, str(Role.Critic))
@@ -919,11 +935,13 @@ class RayPPOTrainer:
         self.actor_rollout_wg.load_checkpoint(
             actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
         )
+        print(f"[RayPPOTrainer][_load_checkpoint] actor loaded from {actor_path}")
         # load critic
         if self.use_critic:
             self.critic_wg.load_checkpoint(
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
+            print(f"[RayPPOTrainer][_load_checkpoint] critic loaded from {critic_path}")
 
         # load dataloader,
         # TODO: from remote not implemented yet
@@ -931,8 +949,11 @@ class RayPPOTrainer:
         if os.path.exists(dataloader_local_path):
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             self.train_dataloader.load_state_dict(dataloader_state_dict)
+            print(f"[RayPPOTrainer][_load_checkpoint] dataloader state loaded: {dataloader_local_path}")
         else:
-            print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+            print(
+                f"[RayPPOTrainer][_load_checkpoint] Warning: no dataloader state at {dataloader_local_path}; start from scratch"
+            )
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""

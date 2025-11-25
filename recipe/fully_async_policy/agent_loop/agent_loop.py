@@ -257,6 +257,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         output_future = worker.generate_sequences_no_post.remote(sample, partial_output_list)
         return await asyncio.wrap_future(output_future.future())
 
+
     def _select_best_worker(self):
         """Select the best worker, simple round-robin load balancing"""
         if not hasattr(self, "_worker_index"):
@@ -276,11 +277,27 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         worker_resume_tasks = [worker.resume_agent_loops.remote() for worker in self.agent_loop_workers]
         await asyncio.gather(*rollout_resume_tasks, *worker_resume_tasks)
 
-    async def wake_up(self):
-        await asyncio.gather(*[replica.wake_up() for replica in self.rollout_replicas])
+    def wake_up(self):
+        """Wake rollout replicas synchronously (used by Trainer validation).
 
-    async def sleep(self):
-        await asyncio.gather(*[replica.sleep() for replica in self.rollout_replicas])
+        Note: This path can be called from within an asyncio loop (rollouter validation)
+        or from a plain sync context (trainer validation). To avoid nested event-loop
+        issues, call Ray actor methods directly and block with ray.get.
+        """
+        refs = []
+        for replica in self.rollout_replicas:
+            # Each server is a Ray actor; remote() returns an ObjectRef
+            refs.extend([server.wake_up.remote() for server in getattr(replica, "servers", [])])
+        if refs:
+            ray.get(refs)
+
+    def sleep(self):
+        """Sleep rollout replicas synchronously (used by Trainer validation)."""
+        refs = []
+        for replica in self.rollout_replicas:
+            refs.extend([server.sleep.remote() for server in getattr(replica, "servers", [])])
+        if refs:
+            ray.get(refs)
 
     async def reset_prefix_cache(self):
         await asyncio.gather(*[replica.reset_prefix_cache() for replica in self.rollout_replicas])
