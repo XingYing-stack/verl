@@ -420,7 +420,7 @@ def compute_score(solution_str: str, ground_truth: str, **kwargs) -> dict:
     else:
         question = extra_info.get("question")
         model = reward_model.get("model")
-        if model is None:
+        if pred is None:
             base_correct = 0
         else:
             base_correct = _llm_scorer(pred, str(ground_truth), question, model)
