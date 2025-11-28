@@ -1,4 +1,4 @@
-# accelerate launch --config_file /home/test/test12/.cache/huggingface/accelerate/fsd_trl_sft.yaml near_miss_pair_PRM/train_marker_prm_with_trl.py
+# accelerate launch --config_file ../config/fsd_trl_sft.yaml train_marker_prm_with_trl.py
 import os
 from typing import Dict, Any, List, Optional
 
@@ -20,6 +20,7 @@ from accelerate import Accelerator
 from transformers import get_cosine_schedule_with_warmup
 from torch.optim import AdamW
 import torch.nn.functional as F
+from verl.utils.torch_functional import entropy_from_logits, masked_mean
 
 accelerator = Accelerator(mixed_precision='bf16')
 
@@ -75,45 +76,20 @@ class DataCollatorForTokenClassification:
 
 
 class MarkerPRMTrainer(Trainer):
-    # def _aggregate_logits_and_labels(
-    #         self,
-    #         outputs,
-    #         loss_mask: torch.Tensor,
-    #         traj_labels: torch.Tensor,
-    # ):
-    #     """
-    #     outputs.logits: (B, L, C)
-    #     loss_mask:     (B, L)   —— marker 位置为 1，其余为 0
-    #     traj_labels:   (B,)
-    #     -> agg_logits: (B, C), traj_labels: (B,)
-    #     """
-    #     logits = outputs.logits.float()              # (B, L, C)
-    #     loss_mask = loss_mask.to(logits.device)      # (B, L)
-    #
-    #     B, L, C = logits.shape
-    #
-    #     # 1. 找出每个样本最后一个 loss_mask == 1 的位置
-    #     mask_bool = loss_mask > 0                   # (B, L) bool
-    #     # 如果你确信每个样本至少一个 marker，可以直接 assert
-    #     assert mask_bool.any(dim=1).all(), "some samples have no marker (loss_mask 全 0)"
-    #
-    #     # 位置索引 [0, 1, 2, ..., L-1]
-    #     positions = torch.arange(L, device=logits.device).unsqueeze(0).expand(B, L)
-    #     # 非 marker 位置设为 -1，这样 max 就会选到最后一个 True 的那个 index
-    #     positions = positions.masked_fill(~mask_bool, -1)
-    #     last_idx = positions.max(dim=1).values      # (B,)
-    #
-    #     # 2. 取出每个样本最后一个 marker 对应的 logits: (B, C)
-    #     batch_idx = torch.arange(B, device=logits.device)
-    #     agg_logits = logits[batch_idx, last_idx]    # (B, C)
-    #
-    #     # 3. labels 搬到同一设备
-    #     traj_labels = traj_labels.to(logits.device).long()  # (B,)
-    #
-    #     return agg_logits, traj_labels
-
-
     # 能不能也学一个重要性呢？直接加权和，学一个重要重要程度？
+    def __init__(
+        self,
+        *args,
+        entropy_coeff: float = 0.0,
+        entropy_mask_mode: str = "marker_only",  # ["non_marker", "marker_only", "all"]
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.entropy_coeff = float(entropy_coeff)
+        assert entropy_mask_mode in {"non_marker", "marker_only", "all"}
+        self.entropy_mask_mode = entropy_mask_mode
+        self._last_entropy_log_step: int = -1
+
     def _aggregate_logits_and_labels(
             self,
             outputs,
@@ -153,9 +129,53 @@ class MarkerPRMTrainer(Trainer):
             outputs, loss_mask, traj_labels
         )
 
-        loss = F.cross_entropy(agg_logits, traj_labels)
+        ce_loss = F.cross_entropy(agg_logits, traj_labels)
 
-        return (loss, outputs) if return_outputs else loss
+        # 可选的熵最小化正则：让输出更“极端”（低熵）
+        total_loss = ce_loss
+        if getattr(self, "entropy_coeff", 0.0) and self.entropy_coeff > 0:
+            # token 级别熵 (B, L)
+            token_entropy = entropy_from_logits(outputs.logits)  # (B, L)
+
+            # 基于配置选择熵正则的掩码
+            attn_mask = inputs.get("attention_mask", None)
+            if attn_mask is not None:
+                attn_mask = attn_mask.to(token_entropy.device).float()
+            else:
+                # 没有 attention_mask 就全部参与
+                attn_mask = torch.ones_like(token_entropy, dtype=torch.float32)
+
+            lm = loss_mask.to(token_entropy.device).float()
+            if self.entropy_mask_mode == "non_marker":
+                entropy_mask = attn_mask * (1.0 - lm)
+            elif self.entropy_mask_mode == "marker_only":
+                entropy_mask = attn_mask * lm
+            else:  # "all"
+                entropy_mask = attn_mask
+
+            # 防止极端情况下掩码全 0
+            if torch.count_nonzero(entropy_mask) == 0:
+                entropy_mask = attn_mask
+
+            # 对被掩码位置做平均作为熵正则损失
+            entropy_loss = masked_mean(token_entropy, entropy_mask)
+            total_loss = total_loss + self.entropy_coeff * entropy_loss
+
+            # 打点：每个 global_step 记录一次指标（避免多次梯度累积重复写入）
+            cur_step = getattr(self.state, "global_step", 0)
+            if cur_step != getattr(self, "_last_entropy_log_step", -1):
+                self._last_entropy_log_step = cur_step
+                try:
+                    self.log(
+                        {
+                            "loss/ce": float(ce_loss.detach().cpu()),
+                            "loss/entropy": float(entropy_loss.detach().cpu()),
+                            "loss/total": float(total_loss.detach().cpu()),
+                        }
+                    )
+                except Exception:
+                    pass
+        return (total_loss, outputs) if return_outputs else total_loss
 
     def prediction_step(
             self,
@@ -237,9 +257,9 @@ def compute_metrics(eval_pred):
 
 
 def main():
-    prefix = '/home/test/test12'
+    prefix = '/nfsdata/fanshengda'
     model_name = prefix + "/models/Qwen/Qwen2.5-7B-Instruct"
-    output_dir = prefix + "/fanshengda/verl/prm_ckpts/last_token_ce"
+    output_dir = prefix + "/verl/prm_ckpts/sum_ce_0.1entropy_1128"
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -264,7 +284,7 @@ def main():
     model.resize_token_embeddings(len(tokenizer))
 
     parquet_paths = [
-        prefix + "/fanshengda/verl/input_data/near_miss_prm/anchor_train_1116.parquet"
+        prefix + "/verl/input_data/near_miss_prm/anchor_train_1116.parquet"
     ]
 
     marker_cfg = {
@@ -320,7 +340,7 @@ def main():
         seed=42,
         report_to='swanlab',   # 你要接 SwanLab/W&B 再改
         # ✅ 关键：lr 降到 1e-6 / 3e-6 这个级别
-        learning_rate=3e-6,
+        learning_rate=1e-5,
         weight_decay=0.01,
         warmup_ratio=0.03,
     )
@@ -335,6 +355,9 @@ def main():
         data_collator=collator,
         tokenizer=tokenizer,
         compute_metrics=compute_metrics,
+        # 设置一个较小的熵正则系数，仅在 marker 位置上最小化熵
+        entropy_coeff=0.1,
+        entropy_mask_mode="marker_only",
     )
 
     trainer.train()
