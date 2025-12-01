@@ -62,7 +62,7 @@ def parse_args():
     parser.add_argument(
         "--model_dir",
         type=str,
-        default="/nfsdata/fanshengda/verl/prm_ckpts/sum_ce_0.1entropy/checkpoint-3000",
+        default="/nfsdata/fanshengda/verl/prm_ckpts/sum_ce_0.1entropy_1128/checkpoint-3570",
         help="训练好 PRM 的模型目录（trainer.save_model 的 output_dir）",
     )
     parser.add_argument(
@@ -74,7 +74,7 @@ def parse_args():
     parser.add_argument(
         "--output_path",
         type=str,
-        default='/nfsdata/fanshengda/verl/near_miss_pair_PRM/output/prm_anchor_validation_1128_ckpt3500.jsonl',
+        default='/nfsdata/fanshengda/verl/near_miss_pair_PRM/output/prm_anchor_validation_1128_ckpt3570.jsonl',
         help="输出 json/jsonl 路径（建议 .jsonl）",
     )
     parser.add_argument(
@@ -170,16 +170,14 @@ def main():
                 input_ids=input_ids,
                 attention_mask=attention_mask,
             )
-            logits = outputs.logits  # (B, L, num_labels=2)
-            probs = torch.softmax(logits, dim=-1)  # (B, L, 2)
+            logits = outputs.logits  # (B, L, 1) —— 单 logit 回归到 0/1
 
             B, L = input_ids.shape
             for b in range(B):
                 seq_input_ids = input_ids[b]            # (L,)
                 seq_attn = attention_mask[b]            # (L,)
                 seq_loss_mask = loss_mask[b]            # (L,)
-                seq_logits = logits[b]                  # (L, 2)
-                seq_probs = probs[b]                    # (L, 2)
+                seq_logits = logits[b]                  # (L, 1)
 
                 # 有效长度（避免 decode 一堆 PAD）
                 valid_len = int(seq_attn.sum().item())
@@ -199,22 +197,16 @@ def main():
                     # token 字面（注意 BPE，可能是片段）
                     token_str = tokenizer.convert_ids_to_tokens([token_id])[0]
 
-                    logit_0 = float(seq_logits[pos, 0].item())
-                    logit_1 = float(seq_logits[pos, 1].item())
-                    prob_0 = float(seq_probs[pos, 0].item())
-                    prob_1 = float(seq_probs[pos, 1].item())
+                    score = float(seq_logits[pos, 0].item())  # 单 logit 分数（不做 sigmoid）
 
-                    markers.append(
-                        {
-                            "marker_id": m_idx,      # 第几个 marker
-                            "token_index": pos,      # 在序列中的 index
-                            "token_id": token_id,
-                            "token": token_str,
-                            "logits": [logit_0, logit_1],
-                            "probs": [prob_0, prob_1],
-                            "score_pos": prob_1,     # 通常我们关心 label=1 的概率
-                        }
-                    )
+                    markers.append({
+                        "marker_id": m_idx,      # 第几个 marker
+                        "token_index": pos,      # 在序列中的 index
+                        "token_id": token_id,
+                        "token": token_str,
+                        "logit": score,
+                        "score": score,         # 保留同义 key，方便下游兼容
+                    })
 
                 record = {
                     "global_index": global_index,

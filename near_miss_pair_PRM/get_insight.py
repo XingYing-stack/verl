@@ -35,8 +35,14 @@ def color_for_score(score: float) -> str:
 
 
 def badge_html(idx: int, score: float, probs=None, tool_name: Optional[str] = None) -> str:
-    bg = color_for_score(score)
-    title = f"marker#{idx} score={score:.3f}"
+    # If score is an unbounded logit, compress for color with sigmoid
+    try:
+        from math import exp
+        score_vis = 1.0 / (1.0 + exp(-float(score)))
+    except Exception:
+        score_vis = max(0.0, min(1.0, float(score)))
+    bg = color_for_score(score_vis)
+    title = f"marker#{idx} score={float(score):.3f}"
     if probs and isinstance(probs, (list, tuple)) and len(probs) == 2:
         title += f"\nprobs=[{probs[0]:.3f}, {probs[1]:.3f}]"
     label = f"marker#{idx}"
@@ -91,7 +97,7 @@ def record_to_html(rec: Dict[str, Any], marker_token: str, gt_text: Optional[str
         # badge for this marker occurrence
         if count < len(markers):
             m = markers[count]
-            score = float(m.get("score_pos", 0.0))
+            score = float(m.get("score_pos", m.get("score", m.get("logit", 0.0))))
             probs = m.get("probs", None)
             # Try to infer tool name from nearest preceding <tool_call> ... {"name": "..."}
             lookback_start = max(0, found - 1200)
@@ -179,7 +185,7 @@ def tty_summary(records: List[Dict[str, Any]], marker_token: str, max_samples: i
     for rec in records[:max_samples]:
         gi = rec.get("global_index")
         mks = rec.get("markers", []) or []
-        scores = [float(m.get("score_pos", 0.0)) for m in mks]
+        scores = [float(m.get("score_pos", m.get("score", m.get("logit", 0.0)))) for m in mks]
         # Build a compact bar with threshold coloring
         def seg(s: float) -> str:
             if s >= 0.8:

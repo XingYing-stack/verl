@@ -9,7 +9,7 @@ tools:
       browser_agent:
         enable: true
         tool_names: ["fetch_url", "visit", "browser_get_page_info", "browser_get_markdown"]
-        browser_agent_url: "http://localhost:28888/v1"
+        browser_agent_url: "http://localhost:38889/v1"
         browser_agent_key: "dada"
         browser_agent_model_name: "qwen3-4b-instruct-2507"
         # Optional override for browser agent request total timeout (seconds)

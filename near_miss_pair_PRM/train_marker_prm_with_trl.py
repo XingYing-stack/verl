@@ -107,7 +107,8 @@ class MarkerPRMTrainer(Trainer):
         loss_mask = loss_mask.unsqueeze(-1)  # (B, L, 1)
 
         agg_logits = (logits * loss_mask).sum(dim=1)  # (B, C)
-        traj_labels = traj_labels.to(logits.device).long()  # (B,)
+        # For regression target 0/1, keep float downstream (loss will cast as needed)
+        traj_labels = traj_labels.to(logits.device)
 
         return agg_logits, traj_labels
 
@@ -129,52 +130,12 @@ class MarkerPRMTrainer(Trainer):
             outputs, loss_mask, traj_labels
         )
 
-        ce_loss = F.cross_entropy(agg_logits, traj_labels)
+        # 改为 MSE 回归到 0/1（不做 sigmoid/BCE）
+        agg_logits = agg_logits.squeeze(-1)  # (B,)
+        mse_loss = F.mse_loss(agg_logits, traj_labels.float())
 
         # 可选的熵最小化正则：让输出更“极端”（低熵）
-        total_loss = ce_loss
-        if getattr(self, "entropy_coeff", 0.0) and self.entropy_coeff > 0:
-            # token 级别熵 (B, L)
-            token_entropy = entropy_from_logits(outputs.logits)  # (B, L)
-
-            # 基于配置选择熵正则的掩码
-            attn_mask = inputs.get("attention_mask", None)
-            if attn_mask is not None:
-                attn_mask = attn_mask.to(token_entropy.device).float()
-            else:
-                # 没有 attention_mask 就全部参与
-                attn_mask = torch.ones_like(token_entropy, dtype=torch.float32)
-
-            lm = loss_mask.to(token_entropy.device).float()
-            if self.entropy_mask_mode == "non_marker":
-                entropy_mask = attn_mask * (1.0 - lm)
-            elif self.entropy_mask_mode == "marker_only":
-                entropy_mask = attn_mask * lm
-            else:  # "all"
-                entropy_mask = attn_mask
-
-            # 防止极端情况下掩码全 0
-            if torch.count_nonzero(entropy_mask) == 0:
-                entropy_mask = attn_mask
-
-            # 对被掩码位置做平均作为熵正则损失
-            entropy_loss = masked_mean(token_entropy, entropy_mask)
-            total_loss = total_loss + self.entropy_coeff * entropy_loss
-
-            # 打点：每个 global_step 记录一次指标（避免多次梯度累积重复写入）
-            cur_step = getattr(self.state, "global_step", 0)
-            if cur_step != getattr(self, "_last_entropy_log_step", -1):
-                self._last_entropy_log_step = cur_step
-                try:
-                    self.log(
-                        {
-                            "loss/ce": float(ce_loss.detach().cpu()),
-                            "loss/entropy": float(entropy_loss.detach().cpu()),
-                            "loss/total": float(total_loss.detach().cpu()),
-                        }
-                    )
-                except Exception:
-                    pass
+        total_loss = mse_loss
         return (total_loss, outputs) if return_outputs else total_loss
 
     def prediction_step(
@@ -186,8 +147,8 @@ class MarkerPRMTrainer(Trainer):
     ):
         """
         让 eval/predict 阶段返回：
-        - loss: aggregated PRM loss
-        - logits: agg_logits (B, 2)
+        - loss: aggregated PRM loss (MSE)
+        - logits: agg_logits (B,)  单 logit 和 0/1 拟合
         - labels: traj_labels (B,)
         这样 compute_metrics 就是纯 PRM 语义了。
         """
@@ -210,28 +171,28 @@ class MarkerPRMTrainer(Trainer):
 
             loss = None
             if has_labels:
-                loss = F.cross_entropy(agg_logits, traj_labels)
+                # 与训练阶段一致：单 logit 上的 MSE
+                loss = F.mse_loss(agg_logits.squeeze(-1), traj_labels.float())
 
         if prediction_loss_only:
             return (loss, None, None)
 
-        # 注意这里返回的是：
-        # logits = (B, 2)，labels = (B,)
-        return (loss, agg_logits, traj_labels)
+        # 返回单维度分数用于阈值分类指标
+        return (loss, agg_logits.squeeze(-1), traj_labels)
 
 
 # ==================== 评估指标 ====================
 def compute_metrics(eval_pred):
     """
-    eval_pred.predictions: (N, 2)  —— aggregated logits
-    eval_pred.label_ids:  (N,)     —— trajectory_labels (0/1)
+    eval_pred.predictions: (N,)  —— aggregated single logits (regressed to 0/1)
+    eval_pred.label_ids:  (N,)   —— trajectory_labels (0/1)
+    
+    采用阈值 0.5 做分类统计，仅用于指标展示。
     """
-    logits = eval_pred.predictions      # (N, 2)
-    labels = eval_pred.label_ids        # (N,)
+    scores = np.asarray(eval_pred.predictions).reshape(-1)  # (N,)
+    labels = np.asarray(eval_pred.label_ids).astype(np.int64).reshape(-1)  # (N,)
 
-    # 有些版本会给 (N, 1)，保险起见 squeeze 一下
-    labels = np.asarray(labels).astype(np.int64).reshape(-1)
-    preds = logits.argmax(-1).astype(np.int64).reshape(-1)
+    preds = (scores >= 0.5).astype(np.int64)
 
     assert preds.shape == labels.shape
 
@@ -268,7 +229,7 @@ def main():
     model = AutoModelForTokenClassification.from_pretrained(
         model_name,
         trust_remote_code=True,
-        num_labels=2,
+        num_labels=1,
         torch_dtype=torch.bfloat16,
         use_cache=False,
         attn_implementation="flash_attention_2",
