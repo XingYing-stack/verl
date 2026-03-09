@@ -4,6 +4,8 @@ import json
 import argparse
 from typing import Dict, Any, List
 
+import numpy as np
+
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForTokenClassification
@@ -62,7 +64,7 @@ def parse_args():
     parser.add_argument(
         "--model_dir",
         type=str,
-        default="/nfsdata/fanshengda/verl/prm_ckpts/sum_ce_0.1entropy_1128/checkpoint-3570",
+        default="/nfsdata/fanshengda/verl/prm_ckpts/mean_mse_entropy_1209/checkpoint-2600",
         help="训练好 PRM 的模型目录（trainer.save_model 的 output_dir）",
     )
     parser.add_argument(
@@ -74,7 +76,7 @@ def parse_args():
     parser.add_argument(
         "--output_path",
         type=str,
-        default='/nfsdata/fanshengda/verl/near_miss_pair_PRM/output/prm_anchor_validation_1128_ckpt3570.jsonl',
+        default='/nfsdata/fanshengda/verl/near_miss_pair_PRM/output/prm_anchor_validation_1209_ckpt2600.jsonl',
         help="输出 json/jsonl 路径（建议 .jsonl）",
     )
     parser.add_argument(
@@ -159,18 +161,35 @@ def main():
     fout = open(args.output_path, "w", encoding="utf-8")
 
     global_index = 0  # 样本全局 idx
+    # 聚合分数与标签（样本级）
+    all_scores: list[float] = []
+    all_labels: list[int] = []
+    skipped_no_marker = 0
 
     with torch.no_grad():
         for batch in dataloader:
             input_ids = batch["input_ids"].to(device)         # (B, L)
             attention_mask = batch["attention_mask"].to(device)  # (B, L)
-            loss_mask = batch["loss_mask"].to(device)         # (B, L)
+            loss_mask = batch["loss_mask"].to(device).float()  # (B, L)
+            traj_labels = batch["trajectory_labels"].to(device).long()  # (B,)
 
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
             )
             logits = outputs.logits  # (B, L, 1) —— 单 logit 回归到 0/1
+
+            # ===== 样本级聚合：对 loss_mask>0 的位置做均值 =====
+            mask = loss_mask.unsqueeze(-1)  # (B, L, 1)
+            steps = mask.sum(dim=1).squeeze(-1)  # (B,)
+            agg_sum = (logits.float() * mask).sum(dim=1).squeeze(-1)  # (B,)
+            # 有些样本可能没有 marker（steps==0），做安全处理并统计跳过数量
+            valid_mask = steps > 0
+            if valid_mask.any():
+                agg_mean = agg_sum[valid_mask] / steps[valid_mask]
+                all_scores.extend(agg_mean.detach().cpu().tolist())
+                all_labels.extend(traj_labels[valid_mask].detach().cpu().tolist())
+            skipped_no_marker += int((~valid_mask).sum().item())
 
             B, L = input_ids.shape
             for b in range(B):
@@ -220,6 +239,68 @@ def main():
 
     fout.close()
     print(f"Done. Wrote {global_index} samples to {args.output_path}")
+
+    # ===== 4. 计算样本级聚合指标（与训练 compute_metrics 对齐）=====
+    if len(all_scores) == 0:
+        print("No valid samples for aggregation (no markers found). Metrics unavailable.")
+        return
+
+    scores = np.asarray(all_scores, dtype=np.float32).reshape(-1)
+    labels = np.asarray(all_labels, dtype=np.int64).reshape(-1)
+
+    preds = (scores >= 0.5).astype(np.int64)
+    tp = int(((preds == 1) & (labels == 1)).sum())
+    tn = int(((preds == 0) & (labels == 0)).sum())
+    fp = int(((preds == 1) & (labels == 0)).sum())
+    fn = int(((preds == 0) & (labels == 1)).sum())
+
+    def safe_div(n: int, d: int) -> float:
+        return float(n) / float(d) if d != 0 else 0.0
+
+    accuracy = safe_div(tp + tn, tp + tn + fp + fn)
+    precision = safe_div(tp, tp + fp)
+    recall = safe_div(tp, tp + fn)
+    f1 = safe_div(2 * precision * recall, precision + recall) if (precision + recall) > 0 else 0.0
+
+    # ROC AUC（基于秩，处理并列）
+    def compute_auc(scores_arr: np.ndarray, labels_arr: np.ndarray) -> float | None:
+        labels_arr = labels_arr.astype(np.int64)
+        n_pos = int(labels_arr.sum())
+        n_neg = int(labels_arr.shape[0] - n_pos)
+        if n_pos == 0 or n_neg == 0:
+            return None
+        order = np.argsort(scores_arr)
+        ranks = np.empty_like(order, dtype=np.float64)
+        n = scores_arr.shape[0]
+        i = 0
+        while i < n:
+            j = i
+            s_i = scores_arr[order[i]]
+            while j + 1 < n and scores_arr[order[j + 1]] == s_i:
+                j += 1
+            avg_rank = (i + j + 2) / 2.0  # 1-based average rank
+            ranks[order[i : j + 1]] = avg_rank
+            i = j + 1
+        sum_ranks_pos = ranks[labels_arr == 1].sum()
+        auc_val = (sum_ranks_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+        return float(auc_val)
+
+    auc = compute_auc(scores, labels)
+
+    if auc is None:
+        auc_str = "N/A (no positive or negative samples)"
+    else:
+        auc_str = f"{auc:.6f}"
+
+    print(
+        "Sample-level aggregated metrics (mean over marker logits):\n"
+        f"  count: {len(scores)} (skipped_no_marker={skipped_no_marker})\n"
+        f"  accuracy:  {accuracy:.6f}\n"
+        f"  precision: {precision:.6f}\n"
+        f"  recall:    {recall:.6f}\n"
+        f"  f1:        {f1:.6f}\n"
+        f"  auc:       {auc_str}"
+    )
 
 
 if __name__ == "__main__":

@@ -110,6 +110,20 @@ def default_compute_score(
     elif data_source == "asearcher":
         from . import asearcher
         res = asearcher.compute_score(solution_str, ground_truth, extra_info=extra_info)
+
+    elif data_source == "AgentProcessBench":
+        # Backward-compat: some group-built parquets may still use AgentProcessBench as data_source
+        if isinstance(extra_info, dict) and isinstance(extra_info.get("trajectories"), list):
+            from . import agent_process_bench_group
+
+            res = agent_process_bench_group.compute_score(solution_str, ground_truth, extra_info=extra_info)
+        else:
+            from . import agent_process_bench
+
+            res = agent_process_bench.compute_score(solution_str, ground_truth, extra_info=extra_info)
+    elif data_source == "AgentProcessBench_GROUP":
+        from . import agent_process_bench_group
+        res = agent_process_bench_group.compute_score(solution_str, ground_truth, extra_info=extra_info)
     elif data_source in ["searchR1_near_miss_prm", "asearcher_near_miss_prm"] :
         from . import pair_comparison
         res = pair_comparison.compute_score(solution_str, ground_truth, extra_info=extra_info)

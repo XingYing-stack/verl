@@ -75,6 +75,8 @@ class AgentData:
 
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
+        # Reason for passive termination (e.g., hitting max turns). Used for downstream filtering.
+        self.terminated_by: Optional[str] = None
 
 
 @register("tool_agent")
@@ -178,7 +180,11 @@ class ToolAgentLoop(AgentLoopBase):
             metrics=agent_data.metrics,
             extra_fields={},
         )
-        output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
+        output.extra_fields.update({
+            "turn_scores": agent_data.turn_scores,
+            "tool_rewards": agent_data.tool_rewards,
+            "terminated_by": agent_data.terminated_by,
+        })
         return output
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
@@ -234,8 +240,10 @@ class ToolAgentLoop(AgentLoopBase):
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
             return AgentState.TERMINATED
         if self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns:
+            agent_data.terminated_by = "max_assistant_turns"
             return AgentState.TERMINATED
         if self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
+            agent_data.terminated_by = "max_user_turns"
             return AgentState.TERMINATED
 
         # Extract tool calls

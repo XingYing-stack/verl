@@ -3,7 +3,7 @@
 # Run from repo root: bash recipe/fully_async_policy/shell/grpo_qwen3_4b_async_mcp.sh
 
 
-# nohup bash recipe/fully_async_policy/shell/grpo_qwen3_4b_async_mcp.sh > ./logs/grpo_async_1128.log 2>&1 &
+# nohup bash recipe/fully_async_policy/shell/multi_card_grpo_qwen3_4b_async_mcp.sh > ./logs/grpo_async_1201.log 2>&1 &
 
 set -x
 export LOGLEVEL=DEBUG
@@ -45,7 +45,7 @@ staleness_threshold=${STALENESS_THRESHOLD:-1.0}
 trigger_parameter_sync_step=${TRIGGER_PARAMETER_SYNC_STEP:-1}
 require_batches=${REQUIRE_BATCHES:-1}
 partial_rollout=${PARTIAL_ROLLOUT:-true}
-data_train="/workspace/verl/input_data/webshaper/ziqin_LLMJudge_docker25_tongyi.parquet"
+data_train="/workspace/verl/input_data/webshaper/ziqin_LLMJudge_docker25_tongyi_1202.parquet"
 data_val="/workspace/verl/input_data/gaia_dev/dev_TextOnly_LLMJudge_docker25_tongyi.parquet"
 tool_config_path="$PROJECT_DIR/examples/sglang_multiturn/config/tool_config/agentcpm_mcp_tool_config.yaml"
 project_name='gaia_dev_async_rl'
@@ -160,7 +160,7 @@ python3 -m recipe.fully_async_policy.fully_async_main \
     trainer.n_gpus_per_node=${TRAINER_NGPUS_PER_NODE} \
     trainer.nnodes=${TRAINER_NNODES} \
     trainer.val_before_train=False \
-    trainer.save_freq=20 \
+    trainer.save_freq=10 \
     trainer.test_freq=-1 \
     trainer.critic_warmup=0 \
     trainer.total_epochs=${total_epochs} \
@@ -177,4 +177,13 @@ python3 -m recipe.fully_async_policy.fully_async_main \
     async_training.use_rollout_log_probs=True \
     async_training.compute_prox_log_prob=True \
     +async_training.final_answer_tag="'</answer>'" \
+    +ray_kwargs.ray_init.address=auto \
+    +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_USE_V1="'1'" \
+    +ray_kwargs.ray_init.runtime_env.env_vars.OPENAI_API_KEY="${OPENAI_API_KEY}" \
+    +ray_kwargs.ray_init.runtime_env.env_vars.OPENAI_BASE_URL="${OPENAI_BASE_URL}" \
+    +ray_kwargs.ray_init.runtime_env.env_vars.SWANLAB_API_KEY="${SWANLAB_API_KEY}" \
+    +ray_kwargs.ray_init.runtime_env.env_vars.SWANLAB_WORKSPACE="${SWANLAB_WORKSPACE}" \
+    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_LOGGING_LEVEL="${VERL_LOGGING_LEVEL}" \
+    +ray_kwargs.ray_init.runtime_env.env_vars.TOKENIZERS_PARALLELISM="'${TOKENIZERS_PARALLELISM:-false}'" \
+    +ray_kwargs.ray_init.runtime_env.env_vars.PYTHONUNBUFFERED="'1'" \
     "$@"

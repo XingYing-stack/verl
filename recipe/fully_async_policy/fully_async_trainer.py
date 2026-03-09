@@ -323,9 +323,11 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                         continue
                     current_valid_rows = valid_rows
                     if dropped_rows:
+                        by_turns = batch.meta_info.get("fully_async/filter/dropped_by_turns", 0)
+                        by_length = batch.meta_info.get("fully_async/filter/dropped_by_length", 0)
                         print(
                             f"[FullyAsyncTrainer] Masked {dropped_rows} filtered rows "
-                            f"before training step"
+                            f"(turns={by_turns}, length={by_length}) before training step"
                         )
                     self._collect_metrics_from_samples(batch, metrics)
                 batch, reward_extra_infos_dict = self._process_batch_common(

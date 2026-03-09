@@ -219,8 +219,10 @@ class AsyncPartialToolAgentLoop(ToolAgentLoop):
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
             return AgentState.TERMINATED
         if self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns:
+            agent_data.terminated_by = "max_assistant_turns"
             return AgentState.TERMINATED
         if self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
+            agent_data.terminated_by = "max_user_turns"
             return AgentState.TERMINATED
 
         # Extract tool calls
@@ -266,6 +268,7 @@ class AsyncPartialToolAgentLoop(ToolAgentLoop):
                 "is_cancel": False,
                 "param_version_start": agent_data.param_version_start,
                 "param_version_end": param_version,
+                "terminated_by": agent_data.terminated_by,
             }
         )
         return output

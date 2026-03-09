@@ -19,12 +19,12 @@ FILES_DIR = "/app/data/gaia_validation"
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_dir", default="/workspace/fanshengda/verl/input_data/webshaper")
+    parser.add_argument("--local_dir", default="/nfsdata/fanshengda/verl/input_data/webshaper")
     parser.add_argument("--metadata_path",
-                        default=["/workspace/gongziqin/1020/AgentRL/assets/unstable/shaper_unstable.jsonl", "/workspace/gongziqin/1020/AgentRL/assets/unstable/unstable2.jsonl"])
+                        default=["/nfsdata/fanshengda/verl/input_data/unstable_all_1202.jsonl"])
     parser.add_argument("--llm_judge", action="store_true")
     parser.add_argument("--llm_judge_model", default="kimi-k2-0905-preview")
-    parser.add_argument("--prompt_type", type=str, default="agentcpm", choices=["agentcpm", "tongyi"])
+    parser.add_argument("--prompt_type", type=str, default="tongyi", choices=["agentcpm", "tongyi"])
 
     args = parser.parse_args()
 
@@ -106,7 +106,7 @@ if __name__ == "__main__":
     # add a row to each data item that represents a unique id
 
     def process_fn(example, idx):
-        question = example['Question']
+        question = example['question']
 
         system_message = deepcopy(gaia_system_prompt_content)
         if 'file_name' in example and example['file_name']:
@@ -115,14 +115,14 @@ if __name__ == "__main__":
 
         else:
             user_prompt = MCP_USER_PROMPT.format(query=question)
-        solution = str(example.get('Final Answer'))
+        solution = str(example.get('answer'))
         if solution == 'nan':
             solution = example['Final answer']
-        print('solution:', solution)
+        print('question:',question,'solution:', solution)
         assert len(solution) > 0
         assert solution != 'nan'
         if args.llm_judge:
-            # print('using llm judge')
+            print('using llm judge')
             reward_model = {
                 "style": "llm",
                 "model": args.llm_judge_model,
@@ -173,6 +173,6 @@ if __name__ == "__main__":
 
     local_dir = args.local_dir
 
-    output_file_name = "ziqin_LLMJudge_docker25_tongyi.parquet"
+    output_file_name = "ziqin_LLMJudge_docker25_tongyi_1202.parquet"
     train_dataset.to_parquet(os.path.join(local_dir, output_file_name))
     print('path:', os.path.join(local_dir, output_file_name))

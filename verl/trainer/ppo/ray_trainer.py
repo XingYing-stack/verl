@@ -1328,6 +1328,23 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                # reward function auxiliary metrics (e.g., ORM_score/PRM_score/format from dict-style rewards)
+                if reward_extra_infos_dict:
+                    for key, vals in reward_extra_infos_dict.items():
+                        if not vals:
+                            continue
+                        # Keep only scalar numeric values for logger backends.
+                        numeric_vals = []
+                        for v in vals:
+                            if isinstance(v, (int, float, np.integer, np.floating, bool)):
+                                numeric_vals.append(float(v))
+                        if not numeric_vals:
+                            continue
+                        arr = np.asarray(numeric_vals, dtype=np.float64)
+                        metrics[f"reward_fn/{key}/mean"] = float(arr.mean())
+                        metrics[f"reward_fn/{key}/max"] = float(arr.max())
+                        metrics[f"reward_fn/{key}/min"] = float(arr.min())
+                        metrics[f"reward_fn/{key}/std"] = float(arr.std())
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # rollout metrics aggregation (tools tokens, truncation stats, multi-turn rounds)
                 # The per-tool detail can be reduced using trainer.rollout_metrics.aggregate_only=True

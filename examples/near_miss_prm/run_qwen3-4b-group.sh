@@ -1,5 +1,5 @@
 
-# nohup bash /nfsdata/fanshengda/verl/examples/near_miss_prm/run_qwen3-4b.sh > ./near_miss_prm_logs/run_qwen3_4B_$(date +"%Y%m%d_%H%M%S").log 2>&1 &
+# nohup bash /nfsdata/fanshengda/verl/examples/near_miss_prm/run_qwen3-4b-group.sh > ./near_miss_prm_logs/run_qwen3_4B_GROUP_$(date +"%Y%m%d_%H%M%S").log 2>&1 &
 
 set -x
 export LOGLEVEL=DEBUG
@@ -12,17 +12,18 @@ temperature=0.6
 top_p=0.95
 top_k=20 # 0 for HF rollout, -1 for vLLM rollout
 
-MODE="process"
+MODE="outcome"
+GROUP_SIZE="2"
 
-experiment_name="qwen3-4B-2507-PRM_from_${MODE}"
+experiment_name="qwen3-4B-2507-PRM_from_${MODE}_GROUP${GROUP_SIZE}"
 
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=/nfsdata/fanshengda/verl/input_data/PRM_from_outcome/${MODE}_train_0228.parquet \
-    data.val_files=/nfsdata/fanshengda/verl/input_data/PRM_from_outcome/${MODE}_dev_0228.parquet \
+    data.train_files=/nfsdata/fanshengda/verl/input_data/PRM_from_outcome/${MODE}_train_group_near_K5_T${GROUP_SIZE}.parquet \
+    data.val_files=/nfsdata/fanshengda/verl/input_data/PRM_from_outcome/${MODE}_dev_group_near_K5_T${GROUP_SIZE}.parquet \
     data.train_batch_size=32 \
-    data.max_prompt_length=24000 \
+    data.max_prompt_length=48000 \
     data.max_response_length=8000 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \

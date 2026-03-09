@@ -76,18 +76,25 @@ class DataCollatorForTokenClassification:
 
 
 class MarkerPRMTrainer(Trainer):
-    # 能不能也学一个重要性呢？直接加权和，学一个重要重要程度？
+    # 通过 mask dropout 与组内方差正则，抑制仅在最后一步“放大”的现象
     def __init__(
         self,
         *args,
         entropy_coeff: float = 0.0,
         entropy_mask_mode: str = "marker_only",  # ["non_marker", "marker_only", "all"]
+        marker_dropout_prob: float = 0.0,        # 在聚合前随机丢弃部分 marker（期望避免只依赖最后一步）
+        variance_coeff: float = 0.0,             # 组内一致性正则系数（鼓励同一条样本各 marker 输出相近）
+        variance_type: str = "l2",               # 一致性度量："l2" | "l1" | "abs_l1"
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.entropy_coeff = float(entropy_coeff)
         assert entropy_mask_mode in {"non_marker", "marker_only", "all"}
         self.entropy_mask_mode = entropy_mask_mode
+        self.marker_dropout_prob = float(marker_dropout_prob)
+        self.variance_coeff = float(variance_coeff)
+        assert variance_type in {"l2", "l1", "abs_l1"}
+        self.variance_type = variance_type
         self._last_entropy_log_step: int = -1
 
     def _aggregate_logits_and_labels(
@@ -106,7 +113,10 @@ class MarkerPRMTrainer(Trainer):
         loss_mask = loss_mask.to(logits.device)  # (B, L)
         loss_mask = loss_mask.unsqueeze(-1)  # (B, L, 1)
 
+        steps = loss_mask.sum(dim=1)  # (B, C)
         agg_logits = (logits * loss_mask).sum(dim=1)  # (B, C)
+
+        agg_logits = agg_logits / steps
         # For regression target 0/1, keep float downstream (loss will cast as needed)
         traj_labels = traj_labels.to(logits.device)
 
@@ -126,16 +136,56 @@ class MarkerPRMTrainer(Trainer):
         inputs.pop("labels", None)
 
         outputs = model(**inputs)
-        agg_logits, traj_labels = self._aggregate_logits_and_labels(
-            outputs, loss_mask, traj_labels
-        )
+        logits = outputs.logits.float()  # (B, L, 1)
 
-        # 改为 MSE 回归到 0/1（不做 sigmoid/BCE）
-        agg_logits = agg_logits.squeeze(-1)  # (B,)
+        # ====== 可选：对 marker 做 dropout，防止只依赖其中一个位置 ======
+        if self.marker_dropout_prob > 0.0:
+            with torch.no_grad():
+                drop = (torch.rand_like(loss_mask) < self.marker_dropout_prob).float()
+                kept = (loss_mask > 0).float() * (1.0 - drop)
+                # 保证每个样本至少保留一个 marker（若全被丢弃，则随机保留一个原 marker）
+                need_fix = kept.sum(dim=1) == 0
+                if need_fix.any():
+                    idxs = torch.nonzero(need_fix).view(-1)
+                    for b in idxs.tolist():
+                        pos = torch.nonzero(loss_mask[b] > 0)
+                        if pos.numel() > 0:
+                            choice = pos[torch.randint(0, pos.shape[0], (1,)).item(), 0]
+                            kept[b, choice] = 1.0
+                loss_mask = kept
+
+        # ====== 样本级均值聚合 ======
+        mask = loss_mask.to(logits.device).unsqueeze(-1)  # (B, L, 1)
+        steps = mask.sum(dim=1).clamp(min=1.0)           # (B, 1)
+        agg_logits = (logits * mask).sum(dim=1) / steps  # (B, 1)
+        agg_logits = agg_logits.squeeze(-1)              # (B,)
+
+        # 主损失：MSE 回归到 0/1
+        traj_labels = traj_labels.to(logits.device)
         mse_loss = F.mse_loss(agg_logits, traj_labels.float())
 
-        # 可选的熵最小化正则：让输出更“极端”（低熵）
-        total_loss = mse_loss
+        # 组内一致性正则：抑制将所有差异压在个别 marker 上
+        var_loss = torch.tensor(0.0, device=logits.device)
+        if self.variance_coeff > 0.0:
+            lm = loss_mask.to(logits.device)
+            logits_2d = logits.squeeze(-1)                             # (B, L)
+            if self.variance_type == "l2":
+                centered = logits_2d - agg_logits.unsqueeze(-1)
+                sq = (centered.pow(2) * lm)
+                per_sample = sq.sum(dim=1) / steps.squeeze(-1)
+                var_loss = per_sample.mean()
+            elif self.variance_type == "l1":
+                abs_dev = (logits_2d - agg_logits.unsqueeze(-1)).abs() * lm
+                per_sample = abs_dev.sum(dim=1) / steps.squeeze(-1)
+                var_loss = per_sample.mean()
+            else:  # "abs_l1": 在绝对值层面做 L1 一致性
+                abs_logits = logits_2d.abs()
+                abs_mean = (abs_logits * lm).sum(dim=1) / steps.squeeze(-1)  # (B,)
+                abs_dev = (abs_logits - abs_mean.unsqueeze(-1)).abs() * lm
+                per_sample = abs_dev.sum(dim=1) / steps.squeeze(-1)
+                var_loss = per_sample.mean()
+
+        total_loss = mse_loss + self.variance_coeff * var_loss
         return (total_loss, outputs) if return_outputs else total_loss
 
     def prediction_step(
@@ -220,7 +270,7 @@ def compute_metrics(eval_pred):
 def main():
     prefix = '/nfsdata/fanshengda'
     model_name = prefix + "/models/Qwen/Qwen2.5-7B-Instruct"
-    output_dir = prefix + "/verl/prm_ckpts/sum_ce_0.1entropy_1128"
+    output_dir = prefix + "/verl/prm_ckpts/mean_mse_entropy_1209"
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -285,7 +335,7 @@ def main():
         output_dir=output_dir,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=2,
-        num_train_epochs=3,
+        num_train_epochs=10,
         logging_steps=1,
         save_steps=200,
         save_total_limit=3,
@@ -316,8 +366,13 @@ def main():
         data_collator=collator,
         tokenizer=tokenizer,
         compute_metrics=compute_metrics,
-        # 设置一个较小的熵正则系数，仅在 marker 位置上最小化熵
-        entropy_coeff=0.1,
+        # 如果想抑制“只学到最后一步”，建议启用以下两项并调参：
+        # 示例：marker_dropout_prob=0.3, variance_coeff=0.05
+        marker_dropout_prob=0.0,
+        variance_coeff=0.1,
+        variance_type="abs_l1",
+        # 若保留，可设极小值或关闭，避免过度推向极端
+        entropy_coeff=0.0,
         entropy_mask_mode="marker_only",
     )
 

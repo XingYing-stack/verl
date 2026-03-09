@@ -268,11 +268,16 @@ def _filter_agent_loop_outputs(rs: RolloutSample, config, tokenizer) -> None:
     final_answer_tag = ""
     if hasattr(config, "async_training") and config.async_training is not None:
         final_answer_tag = config.async_training.get("final_answer_tag", "")
+        filter_exceeded_turns = config.async_training.get("filter_exceeded_turns", False)
+    else:
+        filter_exceeded_turns = False
     max_len = config.actor_rollout_ref.rollout.response_length
 
     filtered_outputs: list[AgentLoopOutput] = []
     kept_indices: list[int] = []
     keep_mask: list[bool] = []
+    dropped_by_turns = 0
+    dropped_by_length = 0
 
     for idx, agent_loop in enumerate(rs.agent_loop_output_list):
         if agent_loop is None:
@@ -289,6 +294,18 @@ def _filter_agent_loop_outputs(rs: RolloutSample, config, tokenizer) -> None:
             decoded = tokenizer.decode(agent_loop.response_ids, skip_special_tokens=False)
             keep = final_answer_tag in decoded
 
+        # If passively terminated by max turns, optionally mark as not-keep so it won't contribute to loss
+        terminated_by = agent_loop.extra_fields.get("terminated_by") if agent_loop.extra_fields else None
+        if terminated_by in {"max_assistant_turns", "max_user_turns"}:
+            if filter_exceeded_turns:
+                if keep:
+                    # override previous keep decision
+                    keep = False
+                dropped_by_turns += 1
+        elif not keep:
+            # Treat remaining non-keep as length-related drop (hit max_len but no final tag)
+            dropped_by_length += 1
+
         filtered_outputs.append(agent_loop)
         kept_indices.append(idx)
         keep_mask.append(keep)
@@ -298,6 +315,8 @@ def _filter_agent_loop_outputs(rs: RolloutSample, config, tokenizer) -> None:
     passed = valid_output_count > 1
     rs.rollout_status["filter/passed"] = passed
     rs.rollout_status["filter/mask"] = keep_mask
+    rs.rollout_status["filter/dropped_by_turns"] = dropped_by_turns
+    rs.rollout_status["filter/dropped_by_length"] = dropped_by_length
 
     # Remove entries that never produced an AgentLoopOutput (kept_indices shorter).
     if kept_indices and rs.full_batch is not None and len(kept_indices) != len(rs.full_batch):
@@ -385,6 +404,14 @@ def assemble_batch_from_rollout_samples(
     processing_times = []
     tool_calls =[]
     rollout_status = rollout_samples[0].rollout_status
+    # Aggregate dropped-by reasons across all rollout samples
+    try:
+        total_dropped_by_turns = sum(rs.rollout_status.get("filter/dropped_by_turns", 0) for rs in rollout_samples)
+        total_dropped_by_length = sum(rs.rollout_status.get("filter/dropped_by_length", 0) for rs in rollout_samples)
+        rollout_status["filter/dropped_by_turns"] = total_dropped_by_turns
+        rollout_status["filter/dropped_by_length"] = total_dropped_by_length
+    except Exception:
+        pass
     # Add a prefix to all rollout_status keys
     rollout_status = {f"fully_async/{key}": value for key, value in rollout_status.items()}
 
