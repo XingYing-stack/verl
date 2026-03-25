@@ -15,10 +15,10 @@ Assumptions
 - Retriever exposes POST /retrieve at http://127.0.0.1:8000/retrieve
 
 Usage example
-    python near_miss_pair_PRM/tree_sampling_near_miss_data.py \
+    python Future_Evidence_PRM/tree_sampling_near_miss_data.py \
         --dataset_path /workspace/fanshengda/verl/input_data/searchR1_processed_direct/train.parquet \
         --output_dir ./rollout_data/tree_sampling \
-        --max_depth 4 --branching_factor 3 --concurrency 32
+        --max_depth 4 --branching_factor 4 --concurrency 32
 
 Notes
 - We do not compute near-miss pairs here; only full trajectories are saved.
@@ -149,6 +149,7 @@ def sample_tree_for_question(
                             {"id": None, "name": legacy.get("name"), "arguments": legacy.get("arguments", {})}
                         ]
 
+                tool_messages: List[Dict[str, Any]] = []
                 for call in structured_calls:
                     if call.get("name") != "search":
                         continue
@@ -181,20 +182,23 @@ def sample_tree_for_question(
                         retrieved = f"Search error: {e}"
 
                     if legacy_mode:
-                        # Legacy format: inject as user content with <tool_response> block
                         tool_resp_block = f"<tool_response>\n{retrieved}\n</tool_response>"
-                        env_msg: Dict[str, Any] = {"role": "user", "content": tool_resp_block}
-                        extended = traj_messages + [env_msg]
+                        tool_messages.append({"role": "user", "content": tool_resp_block})
                     else:
-                        tool_msg: Dict[str, Any] = {
+                        tool_msg = {
                             "role": "tool",
                             "content": retrieved,
                             "name": "search",
                         }
                         if call.get("id"):
                             tool_msg["tool_call_id"] = call["id"]
-                        extended = traj_messages + [tool_msg]
+                        tool_messages.append(tool_msg)
 
+                    if cfg.pause_between_calls_s > 0:
+                        time.sleep(cfg.pause_between_calls_s)
+
+                if tool_messages:
+                    extended = traj_messages + tool_messages
                     next_frontier.append(extended)
                     results.append(
                         TrajectoryRecord(
@@ -208,8 +212,6 @@ def sample_tree_for_question(
                             leaf_output=content,
                         )
                     )
-                    if cfg.pause_between_calls_s > 0:
-                        time.sleep(cfg.pause_between_calls_s)
 
         if not next_frontier:
             break
@@ -343,9 +345,9 @@ def main() -> None:
         help="Directory to save JSONL trajectories.",
     )
     parser.add_argument("--start", type=int, default=0, help="Start row index (inclusive)")
-    parser.add_argument("--end", type=int, default=20000, help="End row index (exclusive); -1 means all")
+    parser.add_argument("--end", type=int, default=1000, help="End row index (exclusive); -1 means all")
     parser.add_argument("--max_depth", type=int, default=4, help="Max tree depth per question")
-    parser.add_argument("--branching_factor", type=int, default=2, help="Branching factor per node")
+    parser.add_argument("--branching_factor", type=int, default=4, help="Branching factor per node")
     parser.add_argument("--concurrency", type=int, default=16, help="Max concurrent questions")
     parser.add_argument(
         "--llm_base_url",

@@ -393,7 +393,7 @@ if __name__ == "__main__":
                         default="/workspace/AgentProcessBench_KDD-main/data")
 
     parser.add_argument("--label_form", default="outcome", choices=["process", "outcome"])
-    parser.add_argument("--traj_num", type=int, default=2, help="一次输入的轨迹个数")
+    parser.add_argument("--traj_num", type=int, default=1, help="一次输入的轨迹个数")
     parser.add_argument("--strategy", default='near', help="构建reward model输入的方法", choices=['near', 'random'])
     parser.add_argument("--K", type=int, default=5, help="每个question选多少个轨迹group")
 

@@ -2,7 +2,7 @@
 Build pair-comparison reward-model data from Search-R1 pass@k rollouts.
 
 Input:
-- `--metadata_path`: JSONL produced by `near_miss_pair_PRM/eval/run_pass@k.py`
+- `--metadata_path`: JSONL produced by `Future_Evidence_PRM/eval/run_pass@k.py`
 
 We group rollouts by `query_index` (typically k=8 per question), pick a partner rollout per sample
 (`random` or `nearest` by `tool_call_similarity`), then label the better trajectory as `positive`
@@ -25,7 +25,7 @@ from typing import Any, Iterable, Optional
 import pandas as pd
 from transformers import AutoTokenizer
 
-from near_miss_pair_PRM.utils import tool_call_similarity
+from Future_Evidence_PRM.utils import tool_call_similarity
 from verl.utils.reward_score.search_r1_like_qa_em import compute_score as qa_em_score
 
 
@@ -300,11 +300,11 @@ def _pair_to_row(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_dir", default="/workspace/fanshengda/verl/input_data/near_miss_prm")
+    parser.add_argument("--local_dir", default="/workspace/fanshengda/verl/input_data/PRM_from_ORM")
     parser.add_argument(
         "--metadata_path",
-        default="/nfsdata/fanshengda/verl/near_miss_pair_PRM/eval/output/pass_at_k/pass_at_k_rollouts_test_0_7405_k8_20251219_114335.jsonl",
-        help="JSONL produced by near_miss_pair_PRM/eval/run_pass@k.py"
+        default="/nfsdata/fanshengda/verl/Future_Evidence_PRM/eval/output/pass_at_k/pass_at_k_rollouts_test_0_7405_k8_20251219_114335.jsonl",
+        help="JSONL produced by Future_Evidence_PRM/eval/run_pass@k.py"
     )
     parser.add_argument("--k", type=int, default=8, help="Expected rollouts per query (used for sanity stats only).")
     parser.add_argument("--seed", type=int, default=42)

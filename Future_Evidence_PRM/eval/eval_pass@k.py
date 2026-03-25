@@ -11,7 +11,7 @@ def main() -> None:
     parser.add_argument(
         "--dataset_path",
         type=str,
-        default="/nfsdata/fanshengda/verl/near_miss_pair_PRM/dataset/hotpotqa_validation.parquet",
+        default="/nfsdata/fanshengda/verl/Future_Evidence_PRM/dataset/hotpotqa_validation.parquet",
     )
     parser.add_argument("--concurrency", type=int, default=16, help="Max concurrent questions")
     parser.add_argument(

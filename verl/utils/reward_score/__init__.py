@@ -111,6 +111,10 @@ def default_compute_score(
         from . import asearcher
         res = asearcher.compute_score(solution_str, ground_truth, extra_info=extra_info)
 
+    elif isinstance(data_source, str) and data_source.startswith("MathProcessJudge"):
+        from . import math_process_judge
+
+        res = math_process_judge.compute_score(solution_str, ground_truth, extra_info=extra_info)
     elif data_source == "AgentProcessBench":
         # Backward-compat: some group-built parquets may still use AgentProcessBench as data_source
         if isinstance(extra_info, dict) and isinstance(extra_info.get("trajectories"), list):

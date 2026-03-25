@@ -146,7 +146,7 @@ Now, based on the two trajectories and the question, produce your JSON answer fo
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_dir", default="/workspace/fanshengda/verl/input_data/near_miss_prm")
+    parser.add_argument("--local_dir", default="/workspace/fanshengda/verl/input_data/PRM_from_ORM")
     parser.add_argument("--metadata_path",
                         default="/workspace/fanshengda/verl/input_data/near_miss_pairs_1108.pkl")
     args = parser.parse_args()

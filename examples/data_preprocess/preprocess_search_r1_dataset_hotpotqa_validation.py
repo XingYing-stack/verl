@@ -194,11 +194,11 @@ def main():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download Search-R1 from HuggingFace, process, and save to Parquet.")
     parser.add_argument(
-        "--hf_repo_id", default="/nfsdata/fanshengda/verl/near_miss_pair_PRM/dataset/hotpotqa_validation.parquet", help="HuggingFace dataset repository ID."
+        "--hf_repo_id", default="/nfsdata/fanshengda/verl/Future_Evidence_PRM/dataset/hotpotqa_validation.parquet", help="HuggingFace dataset repository ID."
     )
     parser.add_argument(
         "--local_dir",
-        default="/nfsdata/fanshengda/verl/near_miss_pair_PRM/input/searchR1_hotpotqa_validation",
+        default="/nfsdata/fanshengda/verl/Future_Evidence_PRM/input/searchR1_hotpotqa_validation",
         help="Local directory to save the processed Parquet files.",
     )
     parser.add_argument("--hdfs_dir", default=None, help="Optional HDFS directory to copy the Parquet files to.")

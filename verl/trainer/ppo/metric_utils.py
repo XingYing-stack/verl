@@ -29,6 +29,8 @@ from verl.utils.import_utils import deprecated
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
 @deprecated("verl.utils.metric.reduce_metrics")
 def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     """
@@ -48,6 +50,188 @@ def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     from verl.utils.metric import reduce_metrics
 
     return reduce_metrics(metrics)
+
+
+def summarize_two_partition_f1_counts(
+    partition_a_match: float,
+    partition_a_total: float,
+    partition_b_match: float,
+    partition_b_total: float,
+    *,
+    prefix: str,
+    partition_a_name: str,
+    partition_b_name: str,
+) -> dict[str, float]:
+    partition_a_acc = partition_a_match / partition_a_total if partition_a_total > 0 else 0.0
+    partition_b_acc = partition_b_match / partition_b_total if partition_b_total > 0 else 0.0
+    denom = partition_a_acc + partition_b_acc
+    f1 = 0.0 if denom == 0 else 2 * partition_a_acc * partition_b_acc / denom
+    return {
+        f"{prefix}/{partition_a_name}_acc": float(partition_a_acc),
+        f"{prefix}/{partition_b_name}_acc": float(partition_b_acc),
+        f"{prefix}/f1": float(f1),
+    }
+
+
+def collect_two_partition_f1_metrics(
+    infos_dict: dict[str, list[Any]],
+    *,
+    partition_a_match_key: str,
+    partition_a_total_key: str,
+    partition_b_match_key: str,
+    partition_b_total_key: str,
+    prefix: str,
+    partition_a_name: str,
+    partition_b_name: str,
+) -> dict[str, float]:
+    required = (
+        partition_a_match_key,
+        partition_a_total_key,
+        partition_b_match_key,
+        partition_b_total_key,
+    )
+    if any(key not in infos_dict for key in required):
+        return {}
+
+    return summarize_two_partition_f1_counts(
+        partition_a_match=float(np.sum(np.asarray(infos_dict[partition_a_match_key], dtype=np.float64))),
+        partition_a_total=float(np.sum(np.asarray(infos_dict[partition_a_total_key], dtype=np.float64))),
+        partition_b_match=float(np.sum(np.asarray(infos_dict[partition_b_match_key], dtype=np.float64))),
+        partition_b_total=float(np.sum(np.asarray(infos_dict[partition_b_total_key], dtype=np.float64))),
+        prefix=prefix,
+        partition_a_name=partition_a_name,
+        partition_b_name=partition_b_name,
+    )
+
+
+def collect_two_partition_f1_metrics_by_data_source(
+    data_sources: np.ndarray,
+    infos_dict: dict[str, list[Any]],
+    *,
+    partition_a_match_key: str,
+    partition_a_total_key: str,
+    partition_b_match_key: str,
+    partition_b_total_key: str,
+    prefix: str,
+    partition_a_name: str,
+    partition_b_name: str,
+) -> dict[str, dict[str, float]]:
+    required = (
+        partition_a_match_key,
+        partition_a_total_key,
+        partition_b_match_key,
+        partition_b_total_key,
+    )
+    if any(key not in infos_dict for key in required):
+        return {}
+
+    data_sources = np.asarray(data_sources, dtype=object)
+    partition_a_match = np.asarray(infos_dict[partition_a_match_key], dtype=np.float64)
+    partition_a_total = np.asarray(infos_dict[partition_a_total_key], dtype=np.float64)
+    partition_b_match = np.asarray(infos_dict[partition_b_match_key], dtype=np.float64)
+    partition_b_total = np.asarray(infos_dict[partition_b_total_key], dtype=np.float64)
+
+    metrics_by_source: dict[str, dict[str, float]] = {}
+    for source in np.unique(data_sources):
+        mask = data_sources == source
+        metrics_by_source[str(source)] = summarize_two_partition_f1_counts(
+            partition_a_match=float(partition_a_match[mask].sum()),
+            partition_a_total=float(partition_a_total[mask].sum()),
+            partition_b_match=float(partition_b_match[mask].sum()),
+            partition_b_total=float(partition_b_total[mask].sum()),
+            prefix=prefix,
+            partition_a_name=partition_a_name,
+            partition_b_name=partition_b_name,
+        )
+    return metrics_by_source
+
+
+def group_validation_samples_by_data_source(
+    data_sources: list[str] | np.ndarray,
+    sample_uids: list[str] | np.ndarray,
+    infos_dict: dict[str, list[Any]],
+    *,
+    source_to_group: Callable[[str], Optional[str]],
+) -> tuple[np.ndarray, np.ndarray, dict[str, list[Any]]]:
+    grouped_sources: list[str] = []
+    grouped_uids: list[Any] = []
+    grouped_infos_dict = {key: [] for key in infos_dict}
+
+    data_sources = np.asarray(data_sources, dtype=object)
+    sample_uids = np.asarray(sample_uids, dtype=object)
+
+    for sample_idx, data_source in enumerate(data_sources):
+        source_name = str(data_source)
+        group_name = source_to_group(source_name)
+        if group_name is None:
+            continue
+        grouped_sources.append(group_name)
+        grouped_uids.append(f"{source_name}::{sample_uids[sample_idx]}")
+        for key, vals in infos_dict.items():
+            grouped_infos_dict[key].append(vals[sample_idx])
+
+    return np.asarray(grouped_sources, dtype=object), np.asarray(grouped_uids, dtype=object), grouped_infos_dict
+
+
+def collect_validation_metrics_by_data_source_group(
+    data_sources: list[str] | np.ndarray,
+    sample_uids: list[str] | np.ndarray,
+    infos_dict: dict[str, list[Any]],
+    *,
+    source_to_group: Callable[[str], Optional[str]],
+    seed: int = 42,
+) -> dict[str, dict[str, dict[str, float]]]:
+    grouped_sources, grouped_uids, grouped_infos_dict = group_validation_samples_by_data_source(
+        data_sources,
+        sample_uids,
+        infos_dict,
+        source_to_group=source_to_group,
+    )
+    if len(grouped_sources) == 0:
+        return {}
+    return process_validation_metrics(grouped_sources.tolist(), grouped_uids.tolist(), grouped_infos_dict, seed=seed)
+
+
+def average_validation_metrics_by_data_source_group(
+    metrics_by_source: dict[str, dict[str, dict[str, float]]],
+    *,
+    source_to_group: Callable[[str], Optional[str]],
+) -> dict[str, dict[str, dict[str, float]]]:
+    grouped_metrics = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for data_source, var2metric2val in metrics_by_source.items():
+        group_name = source_to_group(str(data_source))
+        if group_name is None:
+            continue
+        for var_name, metric2val in var2metric2val.items():
+            for metric_name, metric_val in metric2val.items():
+                grouped_metrics[group_name][var_name][metric_name].append(metric_val)
+
+    averaged_metrics = defaultdict(lambda: defaultdict(dict))
+    for group_name, var2metric2vals in grouped_metrics.items():
+        for var_name, metric2vals in var2metric2vals.items():
+            for metric_name, vals in metric2vals.items():
+                averaged_metrics[group_name][var_name][metric_name] = float(np.mean(vals))
+    return averaged_metrics
+
+
+def average_flat_metrics_by_data_source_group(
+    metrics_by_source: dict[str, dict[str, float]],
+    *,
+    source_to_group: Callable[[str], Optional[str]],
+) -> dict[str, dict[str, float]]:
+    grouped_metrics = defaultdict(lambda: defaultdict(list))
+    for data_source, metric2val in metrics_by_source.items():
+        group_name = source_to_group(str(data_source))
+        if group_name is None:
+            continue
+        for metric_name, metric_val in metric2val.items():
+            grouped_metrics[group_name][metric_name].append(metric_val)
+
+    averaged_metrics = defaultdict(dict)
+    for group_name, metric2vals in grouped_metrics.items():
+        for metric_name, vals in metric2vals.items():
+            averaged_metrics[group_name][metric_name] = float(np.mean(vals))
+    return averaged_metrics
 
 
 def _compute_response_info(batch: DataProto) -> dict[str, Any]:

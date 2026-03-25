@@ -165,7 +165,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--local_dir",
-        default="/workspace/fanshengda/verl/input_data/searchR1_processed_direct",
+        default="/nfsdata/fanshengda/verl/input_data/searchR1_processed_direct",
         help="Local directory to save the processed Parquet files.",
     )
     parser.add_argument("--hdfs_dir", default=None, help="Optional HDFS directory to copy the Parquet files to.")

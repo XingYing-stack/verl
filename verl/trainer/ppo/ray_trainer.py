@@ -44,10 +44,16 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
+    average_flat_metrics_by_data_source_group,
+    average_validation_metrics_by_data_source_group,
+    collect_two_partition_f1_metrics,
+    collect_two_partition_f1_metrics_by_data_source,
+    collect_validation_metrics_by_data_source_group,
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_rollout_metrics,
+    group_validation_samples_by_data_source,
     process_validation_metrics,
     _compute_response_info
 )
@@ -686,6 +692,30 @@ class RayPPOTrainer:
         data_sources = np.concatenate(data_source_lst, axis=0)
 
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+
+        def map_processbench_group(data_source: str, reduction: str) -> str | None:
+            prefix = "MathProcessJudge/processbench/"
+            if not data_source.startswith(prefix):
+                return None
+            suffix = data_source[len(prefix):]
+            if suffix in {"micro", "macro"} or "/" in suffix:
+                return None
+            return f"{prefix}{reduction}"
+
+        processbench_micro_metrics = collect_validation_metrics_by_data_source_group(
+            data_sources,
+            sample_uids,
+            reward_extra_infos_dict,
+            source_to_group=lambda source: map_processbench_group(source, "micro"),
+        )
+        data_src2var2metric2val.update(processbench_micro_metrics)
+
+        processbench_macro_metrics = average_validation_metrics_by_data_source_group(
+            data_src2var2metric2val,
+            source_to_group=lambda source: map_processbench_group(source, "macro"),
+        )
+        data_src2var2metric2val.update(processbench_macro_metrics)
+
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
@@ -702,6 +732,50 @@ class RayPPOTrainer:
                         metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
+
+        first_error_metrics_by_source = collect_two_partition_f1_metrics_by_data_source(
+            data_sources,
+            reward_extra_infos_dict,
+            partition_a_match_key="first_error_error_match",
+            partition_a_total_key="first_error_error_total",
+            partition_b_match_key="first_error_correct_match",
+            partition_b_total_key="first_error_correct_total",
+            prefix="first_error",
+            partition_a_name="error",
+            partition_b_name="correct",
+        )
+        processbench_micro_sources, _, processbench_micro_infos = group_validation_samples_by_data_source(
+            data_sources,
+            sample_uids,
+            reward_extra_infos_dict,
+            source_to_group=lambda source: map_processbench_group(source, "micro"),
+        )
+        if len(processbench_micro_sources) > 0:
+            processbench_micro_first_error = collect_two_partition_f1_metrics_by_data_source(
+                processbench_micro_sources,
+                processbench_micro_infos,
+                partition_a_match_key="first_error_error_match",
+                partition_a_total_key="first_error_error_total",
+                partition_b_match_key="first_error_correct_match",
+                partition_b_total_key="first_error_correct_total",
+                prefix="first_error",
+                partition_a_name="error",
+                partition_b_name="correct",
+            )
+            first_error_metrics_by_source.update(processbench_micro_first_error)
+
+        processbench_macro_first_error = average_flat_metrics_by_data_source_group(
+            first_error_metrics_by_source,
+            source_to_group=lambda source: map_processbench_group(source, "macro"),
+        )
+        first_error_metrics_by_source.update(processbench_macro_first_error)
+
+        for data_source, first_error_metrics in first_error_metrics_by_source.items():
+            metric_dict[f"val-core/{data_source}/first_error/f1"] = first_error_metrics["first_error/f1"]
+            metric_dict[f"val-aux/{data_source}/first_error/error_acc"] = first_error_metrics["first_error/error_acc"]
+            metric_dict[f"val-aux/{data_source}/first_error/correct_acc"] = first_error_metrics[
+                "first_error/correct_acc"
+            ]
 
         if non_aborted_total > 0:
             metric_dict["val-core/global/response_length_non_aborted/clip_ratio"] = clip_hit_total / non_aborted_total
@@ -1345,6 +1419,18 @@ class RayPPOTrainer:
                         metrics[f"reward_fn/{key}/max"] = float(arr.max())
                         metrics[f"reward_fn/{key}/min"] = float(arr.min())
                         metrics[f"reward_fn/{key}/std"] = float(arr.std())
+                    first_error_metrics = collect_two_partition_f1_metrics(
+                        reward_extra_infos_dict,
+                        partition_a_match_key="first_error_error_match",
+                        partition_a_total_key="first_error_error_total",
+                        partition_b_match_key="first_error_correct_match",
+                        partition_b_total_key="first_error_correct_total",
+                        prefix="first_error",
+                        partition_a_name="error",
+                        partition_b_name="correct",
+                    )
+                    for key, value in first_error_metrics.items():
+                        metrics[f"reward_fn/{key}"] = value
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # rollout metrics aggregation (tools tokens, truncation stats, multi-turn rounds)
                 # The per-tool detail can be reduced using trainer.rollout_metrics.aggregate_only=True

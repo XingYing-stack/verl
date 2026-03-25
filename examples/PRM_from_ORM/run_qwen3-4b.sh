@@ -1,5 +1,5 @@
 
-# nohup bash /nfsdata/fanshengda/verl/examples/near_miss_prm/run_qwen3-4b.sh > ./near_miss_prm_logs/run_qwen3_4B_$(date +"%Y%m%d_%H%M%S").log 2>&1 &
+# nohup bash /nfsdata/fanshengda/verl/examples/PRM_from_ORM/run_qwen3-4b.sh > ./near_miss_prm_logs/run_qwen3_4B_$(date +"%Y%m%d_%H%M%S").log 2>&1 &
 
 set -x
 export LOGLEVEL=DEBUG

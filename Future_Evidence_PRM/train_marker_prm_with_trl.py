@@ -295,7 +295,7 @@ def main():
     model.resize_token_embeddings(len(tokenizer))
 
     parquet_paths = [
-        prefix + "/verl/input_data/near_miss_prm/anchor_train_1116.parquet"
+        prefix + "/verl/input_data/PRM_from_ORM/anchor_train_1116.parquet"
     ]
 
     marker_cfg = {

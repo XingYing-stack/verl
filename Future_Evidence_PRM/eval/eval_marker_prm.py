@@ -70,13 +70,13 @@ def parse_args():
     parser.add_argument(
         "--parquet_path",
         type=str,
-        default="/nfsdata/fanshengda/verl/input_data/near_miss_prm/anchor_validation_1116.parquet",
+        default="/nfsdata/fanshengda/verl/input_data/PRM_from_ORM/anchor_validation_1116.parquet",
         help="要评估的 parquet 文件路径",
     )
     parser.add_argument(
         "--output_path",
         type=str,
-        default='/nfsdata/fanshengda/verl/near_miss_pair_PRM/output/prm_anchor_validation_1209_ckpt2600.jsonl',
+        default='/nfsdata/fanshengda/verl/Future_Evidence_PRM/output/prm_anchor_validation_1209_ckpt2600.jsonl',
         help="输出 json/jsonl 路径（建议 .jsonl）",
     )
     parser.add_argument(

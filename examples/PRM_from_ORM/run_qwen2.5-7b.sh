@@ -1,5 +1,5 @@
 
-# n/examples/near_miss_prm/run_qwen2.5-7b.sh > ./near_miss_prm_logs/run_qwen25_7B_$(date +"%Y%m%d_%H%M%S").log 2>&1 &
+# n/examples/PRM_from_ORM/run_qwen2.5-7b.sh > ./near_miss_prm_logs/run_qwen25_7B_$(date +"%Y%m%d_%H%M%S").log 2>&1 &
 
 set -x
 export LOGLEVEL=DEBUG
@@ -16,8 +16,8 @@ experiment_name="qwen2.5-7b-SearchR1-1108-DrGRPO"
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=/workspace/fanshengda/verl/input_data/near_miss_prm/train_1108.parquet \
-    data.val_files=/workspace/fanshengda/verl/input_data/near_miss_prm/validation_1108.parquet \
+    data.train_files=/workspace/fanshengda/verl/input_data/PRM_from_ORM/train_1108.parquet \
+    data.val_files=/workspace/fanshengda/verl/input_data/PRM_from_ORM/validation_1108.parquet \
     data.train_batch_size=32 \
     data.max_prompt_length=10000 \
     data.max_response_length=2000 \
@@ -55,7 +55,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","swanlab"]' \
-    trainer.project_name='near_miss_prm' \
+    trainer.project_name='PRM_from_ORM' \
     trainer.experiment_name=$experiment_name \
     trainer.default_local_dir="/workspace/fanshengda/verl/reward_model_ckpts/$experiment_name" \
     trainer.validation_data_dir="/workspace/fanshengda/verl/rollout_data/$experiment_name-validation" \
