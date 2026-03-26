@@ -31,6 +31,7 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 
 import verl.utils.torch_functional as verl_F
 from verl.utils.model import compute_position_id_with_mask
+from verl.utils.tokenizer import render_chat_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,17 @@ class RLHFDataset(Dataset):
         self.shuffle = config.get("shuffle", False)
         self.seed = config.get("seed")
 
+        self.use_plain_prompt_fallback = (
+            self.processor is None
+            and self.apply_chat_template_kwargs.get("chat_template") is None
+            and not getattr(self.tokenizer, "chat_template", None)
+        )
+        if self.use_plain_prompt_fallback:
+            logger.warning(
+                "tokenizer.chat_template is not set; falling back to plain role-tagged prompts "
+                "formatted as `System: ...`, `User: ...`, `Assistant: ...`."
+            )
+
         self._download()
         self._read_files_and_tokenize()
 
@@ -177,7 +189,6 @@ class RLHFDataset(Dataset):
         if self.filter_overlong_prompts:
             tokenizer = self.tokenizer
             processor = self.processor
-            prompt_key = self.prompt_key
             image_key = self.image_key
             video_key = self.video_key
 
@@ -233,13 +244,9 @@ class RLHFDataset(Dataset):
 
                 def doc2len(doc) -> int:
                     try:
-                        apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        if self.tool_schemas is not None:
-                            apply_kwargs["tools"] = self.tool_schemas
-
-                        return len(
-                            tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True, **apply_kwargs)
-                        )
+                        messages = self._build_messages(doc)
+                        raw_prompt = self._render_tokenizer_prompt(messages)
+                        return len(tokenizer(raw_prompt, add_special_tokens=False).input_ids)
                     except Exception:
                         print("Error processing one of the samples, skipping...")
                         traceback.print_exc()
@@ -286,6 +293,17 @@ class RLHFDataset(Dataset):
                 message["content"] = content_list
 
         return messages
+
+    def _render_tokenizer_prompt(self, messages: list[dict]) -> str:
+        apply_kwargs = dict(**self.apply_chat_template_kwargs)
+        if self.tool_schemas is not None:
+            apply_kwargs["tools"] = self.tool_schemas
+        return render_chat_prompt(
+            self.tokenizer,
+            messages,
+            add_generation_prompt=True,
+            apply_chat_template_kwargs=apply_kwargs,
+        )
 
     def __getitem__(self, item):
         """
@@ -355,14 +373,9 @@ class RLHFDataset(Dataset):
                 row_dict["multi_modal_inputs"].pop("second_per_grid_ts", None)
 
         else:
-            if self.apply_chat_template_kwargs.get("chat_template") is None:
-                assert hasattr(self.tokenizer, "chat_template"), (
-                    "chat_template should be provided in apply_chat_template_kwargs or tokenizer config, "
-                    "models like GLM can copy chat_template.jinja from instruct models"
-                )
-            raw_prompt = self.tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
-            )
+            # 负责把prompt完整地构建出来，决定了prompt长什么样子
+            raw_prompt = self._render_tokenizer_prompt(messages)
+            # 转成ids，不作任何操作
             model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")

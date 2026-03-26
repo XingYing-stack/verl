@@ -14,8 +14,9 @@
 """Utils for tokenization."""
 
 import warnings
+from typing import Any
 
-__all__ = ["hf_tokenizer", "hf_processor"]
+__all__ = ["hf_tokenizer", "hf_processor", "render_chat_prompt"]
 
 
 def set_pad_token_id(tokenizer):
@@ -31,6 +32,100 @@ def set_pad_token_id(tokenizer):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         warnings.warn(f"tokenizer.pad_token is None. Now set to {tokenizer.eos_token}", stacklevel=1)
+
+
+def _stringify_chat_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list | tuple):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                item_type = item.get("type")
+                if item_type == "text":
+                    parts.append(str(item.get("text", "")))
+                elif item_type == "image":
+                    parts.append("<image>")
+                elif item_type == "video":
+                    parts.append("<video>")
+                else:
+                    parts.append(str(item))
+            else:
+                parts.append(str(item))
+        return "".join(parts)
+
+    return str(content)
+
+
+def _render_plain_prompt(messages: list[dict[str, Any]], add_generation_prompt: bool = True) -> str:
+    lines = []
+    for message in messages:
+        role = str(message.get("role", "user")).strip().lower()
+        content = _stringify_chat_content(message.get("content", "")).strip()
+
+        if role == "system":
+            lines.append(f"System: {content}")
+        elif role == "assistant":
+            lines.append(f"Assistant: {content}")
+        elif role == "user":
+            lines.append(f"User: {content}")
+        else:
+            lines.append(f"{role.title()}: {content}")
+
+    if add_generation_prompt:
+        lines.append("Assistant:")
+
+    return "\n".join(lines)
+
+
+def _validate_plain_prompt_fallback(messages: list[dict[str, Any]], apply_kwargs: dict[str, Any]) -> None:
+    if apply_kwargs.get("tools"):
+        raise ValueError(
+            "Plain-prompt fallback does not support tool schemas. "
+            "Please provide a tokenizer chat_template or pass apply_chat_template_kwargs.chat_template."
+        )
+
+    if apply_kwargs.get("documents"):
+        raise ValueError(
+            "Plain-prompt fallback does not support chat-template documents. "
+            "Please provide a tokenizer chat_template or pass apply_chat_template_kwargs.chat_template."
+        )
+
+    for idx, message in enumerate(messages):
+        role = str(message.get("role", "user")).strip().lower()
+        if message.get("tool_calls"):
+            raise ValueError(
+                f"Plain-prompt fallback does not support tool_calls in message {idx}. "
+                "Please provide a tokenizer chat_template or pass apply_chat_template_kwargs.chat_template."
+            )
+        if role == "tool":
+            raise ValueError(
+                f"Plain-prompt fallback does not support tool-role messages (message {idx}). "
+                "Please provide a tokenizer chat_template or pass apply_chat_template_kwargs.chat_template."
+            )
+
+
+def render_chat_prompt(tokenizer, messages, add_generation_prompt: bool = True, apply_chat_template_kwargs=None) -> str:
+    """Render chat messages to a string prompt.
+
+    If the tokenizer exposes a chat template, use it. Otherwise, fall back to
+    a plain role-tagged prompt of the form ``User: ...`` / ``Assistant: ...``.
+    """
+
+    apply_kwargs = dict(apply_chat_template_kwargs or {})
+    apply_kwargs.pop("tokenize", None)
+
+    if apply_kwargs.get("chat_template") is not None or getattr(tokenizer, "chat_template", None):
+        return tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            tokenize=False,
+            **apply_kwargs,
+        )
+
+    _validate_plain_prompt_fallback(messages, apply_kwargs)
+    return _render_plain_prompt(messages, add_generation_prompt=add_generation_prompt)
 
 
 def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kwargs):
