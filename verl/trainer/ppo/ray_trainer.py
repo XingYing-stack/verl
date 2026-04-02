@@ -44,8 +44,12 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
+    PRMBENCH_CORRECT_SOURCE,
+    PRMBENCH_DATA_SOURCE_PREFIX,
     average_flat_metrics_by_data_source_group,
     average_validation_metrics_by_data_source_group,
+    collect_prmbench_metrics_by_data_source,
+    collect_prmbench_similarity_by_data_source,
     collect_two_partition_f1_metrics,
     collect_two_partition_f1_metrics_by_data_source,
     collect_validation_metrics_by_data_source_group,
@@ -54,6 +58,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     compute_rollout_metrics,
     group_validation_samples_by_data_source,
+    map_prmbench_source_to_group,
     process_validation_metrics,
     _compute_response_info
 )
@@ -776,6 +781,57 @@ class RayPPOTrainer:
             metric_dict[f"val-aux/{data_source}/first_error/correct_acc"] = first_error_metrics[
                 "first_error/correct_acc"
             ]
+
+        prmbench_metrics_by_source = collect_prmbench_metrics_by_data_source(data_sources, reward_extra_infos_dict)
+        if prmbench_metrics_by_source:
+            prmbench_overall_sources, _, prmbench_overall_infos = group_validation_samples_by_data_source(
+                data_sources,
+                sample_uids,
+                reward_extra_infos_dict,
+                source_to_group=lambda source: (
+                    f"{PRMBENCH_DATA_SOURCE_PREFIX}/overall"
+                    if source.startswith(f"{PRMBENCH_DATA_SOURCE_PREFIX}/") and source != PRMBENCH_CORRECT_SOURCE
+                    else None
+                ),
+            )
+            if len(prmbench_overall_sources) > 0:
+                prmbench_metrics_by_source.update(
+                    collect_prmbench_metrics_by_data_source(prmbench_overall_sources, prmbench_overall_infos)
+                )
+
+            prmbench_similarity_by_source = collect_prmbench_similarity_by_data_source(data_sources, reward_extra_infos_dict)
+            for data_source, similarity_metrics in prmbench_similarity_by_source.items():
+                prmbench_metrics_by_source.setdefault(data_source, {}).update(similarity_metrics)
+
+            prmbench_group_scores = average_flat_metrics_by_data_source_group(
+                {
+                    data_source: {"prm_score": metrics["prm_score"]}
+                    for data_source, metrics in prmbench_metrics_by_source.items()
+                    if data_source.startswith(f"{PRMBENCH_DATA_SOURCE_PREFIX}/")
+                    and data_source not in {PRMBENCH_CORRECT_SOURCE, f"{PRMBENCH_DATA_SOURCE_PREFIX}/overall"}
+                },
+                source_to_group=map_prmbench_source_to_group,
+            )
+
+            for data_source, metrics in prmbench_metrics_by_source.items():
+                if data_source == PRMBENCH_CORRECT_SOURCE:
+                    continue
+                if "prm_score" in metrics:
+                    metric_dict[f"val-core/{data_source}/prm_score"] = metrics["prm_score"]
+                for metric_name in [
+                    "f1",
+                    "negative_f1",
+                    "total_step_acc",
+                    "correct_step_acc",
+                    "wrong_step_acc",
+                    "first_error_acc",
+                    "similarity",
+                ]:
+                    if metric_name in metrics:
+                        metric_dict[f"val-aux/{data_source}/{metric_name}"] = metrics[metric_name]
+
+            for data_source, metrics in prmbench_group_scores.items():
+                metric_dict[f"val-core/{data_source}/prm_score"] = metrics["prm_score"]
 
         if non_aborted_total > 0:
             metric_dict["val-core/global/response_length_non_aborted/clip_ratio"] = clip_hit_total / non_aborted_total
