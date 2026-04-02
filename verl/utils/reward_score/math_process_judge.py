@@ -156,23 +156,24 @@ def compute_score(solution_str: str, ground_truth: str, *, extra_info: dict | No
         "first_error_error_total": float(gt_first_error != -1),
         "first_error_correct_match": 0.0,
         "first_error_correct_total": float(gt_first_error == -1),
+        "prmbench_tp": 0.0,
+        "prmbench_fp": 0.0,
+        "prmbench_tn": 0.0,
+        "prmbench_fn": 0.0,
+        "prmbench_correct_step_match": 0.0,
+        "prmbench_correct_step_total": 0.0,
+        "prmbench_wrong_step_match": 0.0,
+        "prmbench_wrong_step_total": 0.0,
+        "prmbench_total_step_match": 0.0,
+        "prmbench_total_step_total": 0.0,
+        "prmbench_first_error_match": 0.0,
+        "prmbench_first_error_total": 0.0,
+        "prmbench_model_response_acc": -1.0,
+        "prmbench_pair_id": "",
     }
     if extra_info.get("benchmark_name") == "prmbench":
         result.update(
             {
-                "prmbench_tp": 0.0,
-                "prmbench_fp": 0.0,
-                "prmbench_tn": 0.0,
-                "prmbench_fn": 0.0,
-                "prmbench_correct_step_match": 0.0,
-                "prmbench_correct_step_total": 0.0,
-                "prmbench_wrong_step_match": 0.0,
-                "prmbench_wrong_step_total": 0.0,
-                "prmbench_total_step_match": 0.0,
-                "prmbench_total_step_total": 0.0,
-                "prmbench_first_error_match": 0.0,
-                "prmbench_first_error_total": 0.0,
-                "prmbench_model_response_acc": -1.0,
                 "prmbench_pair_id": str(extra_info["pair_id"]),
             }
         )
