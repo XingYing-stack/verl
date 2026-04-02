@@ -10,10 +10,10 @@ export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=2400
 
 
 MODE="ORM"
-#MODEL_PATH=/nfsdata/fanshengda/models/Qwen/Qwen3-4B-Instruct-2507
-MODEL_PATH=/nfsdata/models/Qwen2.5-7B-Instruct
+MODEL_PATH=/nfsdata/fanshengda/models/Qwen/Qwen3-4B-Thinking-2507
+#MODEL_PATH=/nfsdata/models/Qwen2.5-7B-Instruct
 DATA_DIR=/nfsdata/fanshengda/verl/PRM_from_ORM/processed_math_process_judge
-EXPERIMENT_NAME="qwen2.5-7B-Instruct-PRM_from_${MODE}_MATH"
+EXPERIMENT_NAME="Qwen3-4B-Thinking-2507-PRM_from_${MODE}_MATH_TokenMean_NoNormAdv"
 TRAIN_FILES=${TRAIN_FILES:-${DATA_DIR}/scan_pro_train.parquet}
 #VAL_FILES=${VAL_FILES:-"['${DATA_DIR}/scan_pro_dev.parquet','${DATA_DIR}/processbench_eval.parquet']"}
 VAL_FILES=${VAL_FILES:-"['${DATA_DIR}/processbench_eval.parquet']"}
@@ -33,7 +33,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.nccl_timeout=64000 \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.loss_agg_mode="seq-mean-token-sum-norm" \
+    actor_rollout_ref.actor.loss_agg_mode="token-mean" \
     algorithm.norm_adv_by_std_in_grpo=False \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
@@ -72,5 +72,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.val_before_train=True \
     trainer.save_freq=100 \
-    trainer.test_freq=20 \
+    trainer.test_freq=10 \
     trainer.total_epochs=10 $@

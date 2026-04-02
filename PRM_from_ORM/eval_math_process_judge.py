@@ -7,6 +7,7 @@ import torch
 from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
+from verl.utils.tokenizer import render_chat_prompt
 from verl.utils.reward_score.math_process_judge import _first_error_index, _normalize_output
 from verl.utils.reward_score.agent_process_bench import _extract_json_object
 
@@ -33,8 +34,8 @@ def prepare_messages(template: str, item: dict) -> list[dict[str, str]]:
     return [{"role": "user", "content": prompt}]
 
 
-def apply_chat_template(tokenizer, messages):
-    prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+def encode_prompt(tokenizer, messages):
+    prompt = render_chat_prompt(tokenizer, messages, add_generation_prompt=True)
     return tokenizer(prompt, add_special_tokens=False).input_ids
 
 
@@ -93,7 +94,7 @@ if __name__ == "__main__":
 
     for config in args.configs:
         input_data = load_processbench_json(os.path.join(args.processbench_dir, f"{config}.json"))
-        prompt_token_ids = [apply_chat_template(tokenizer, prepare_messages(template, item)) for item in input_data]
+        prompt_token_ids = [encode_prompt(tokenizer, prepare_messages(template, item)) for item in input_data]
         generations = llm.generate(prompt_token_ids=prompt_token_ids, sampling_params=sampling_params)
 
         output_dir = os.path.join(args.output_dir, args.model_name if not args.use_voting else f"{args.model_name}_voting")

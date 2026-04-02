@@ -168,13 +168,18 @@ if __name__ == "__main__":
         help="Directory containing ProcessBench json files.",
     )
     parser.add_argument(
+        "--prmbench_path",
+        default="./PRM_from_ORM/prmbench_preview.jsonl",
+        help="Directory containing PRMBench json files.",
+    )
+    parser.add_argument(
         "--template_path",
-        default="./PRM_from_ORM/templates/math_process_judge_prompt_direct_answer.txt",
+        default="./PRM_from_ORM/templates/math_process_judge_prompt.txt",
         help="Prompt template path.",
     )
     parser.add_argument(
         "--output_dir",
-        default="./PRM_from_ORM/processed_math_process_judge_direct_answer",
+        default="./PRM_from_ORM/processed_math_process_judge",
         help="Where to save generated parquet files.",
     )
     parser.add_argument(

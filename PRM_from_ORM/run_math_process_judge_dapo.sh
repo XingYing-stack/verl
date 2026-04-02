@@ -10,10 +10,10 @@ export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=2400
 
 
 MODE="ORM"
-MODEL_PATH=/nfsdata/fanshengda/models/Qwen/Qwen3-4B-Instruct-2507
-#MODEL_PATH=/nfsdata/models/Qwen2.5-7B-Instruct
-DATA_DIR=/nfsdata/fanshengda/verl/PRM_from_ORM/processed_math_process_judge
-EXPERIMENT_NAME="qwen3-4B-Instruct-2507-PRM_from_${MODE}_MATH_DAPO"
+#MODEL_PATH=/nfsdata/fanshengda/models/Qwen/Qwen3-4B-Instruct-2507
+MODEL_PATH=/nfsdata/models/Qwen2.5-7B-Instruct
+DATA_DIR=/nfsdata/fanshengda/verl/PRM_from_ORM/processed_math_process_judge_ICL
+EXPERIMENT_NAME="Qwen2.5-7B-Instruct-PRM_from_${MODE}_MATH_DAPO_ICL"
 TRAIN_FILES=${TRAIN_FILES:-${DATA_DIR}/scan_pro_train.parquet}
 #VAL_FILES=${VAL_FILES:-"['${DATA_DIR}/scan_pro_dev.parquet','${DATA_DIR}/processbench_eval.parquet']"}
 VAL_FILES=${VAL_FILES:-"['${DATA_DIR}/processbench_eval.parquet']"}
@@ -24,7 +24,7 @@ python3 -m recipe.dapo.main_dapo \
     algorithm.adv_estimator=grpo \
     data.train_files="${TRAIN_FILES}" \
     data.val_files="${VAL_FILES}" \
-    data.train_max_samples=20000 \
+    data.train_max_samples=90000 \
     data.train_batch_size=32 \
     data.max_prompt_length=12000 \
     data.max_response_length=18192 \
@@ -76,5 +76,5 @@ python3 -m recipe.dapo.main_dapo \
     trainer.nnodes=1 \
     trainer.val_before_train=True \
     trainer.save_freq=100 \
-    trainer.test_freq=20 \
+    trainer.test_freq=10 \
     trainer.total_epochs=10 $@
